@@ -3,6 +3,8 @@
 
 **Automated, Multi-Platform, High-Precision Request Sender for Xiaomi Bootloader Unlock**
 
+![Screenshot](https://i.ibb.co/67Xd3pSJ/1.png)
+
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20Android%20(Termux)-blue)](https://github.com/fl4te/mi-bootloader-unlock-tool)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-yellow)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Educational%20Use%20Only-red)](https://github.com/fl4te/mi-bootloader-unlock-tool)

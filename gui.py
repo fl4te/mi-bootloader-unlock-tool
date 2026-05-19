@@ -39,18 +39,30 @@ UA          = "okhttp/4.12.0"
 NTP_SERVERS = ["ntp0.ntp-servers.net", "ntp1.ntp-servers.net", "ntp2.ntp-servers.net"]
 
 COLORS = {
-    "bg":        "#0d0f14",
-    "panel":     "#13161e",
-    "border":    "#1e2230",
-    "accent":    "#f97316",
-    "accent2":   "#3b82f6",
-    "success":   "#22c55e",
-    "warn":      "#eab308",
-    "error":     "#ef4444",
-    "text":      "#e2e8f0",
-    "muted":     "#64748b",
-    "input_bg":  "#1a1d27",
+    "bg":           "#0b0d13",
+    "panel":        "#12151f",
+    "panel2":       "#181c28",
+    "border":       "#252a3a",
+    "border_light": "#2e3448",
+    "accent":       "#f97316",
+    "accent_dim":   "#7c3a10",
+    "accent2":      "#6366f1",
+    "accent2_dim":  "#312e81",
+    "success":      "#22c55e",
+    "success_dim":  "#14532d",
+    "warn":         "#f59e0b",
+    "warn_dim":     "#78350f",
+    "error":        "#f43f5e",
+    "error_dim":    "#881337",
+    "text":         "#e2e8f0",
+    "text_dim":     "#94a3b8",
+    "muted":        "#4b5675",
+    "input_bg":     "#0f1119",
+    "header_bg":    "#0e1018",
 }
+
+FONT_MONO  = "Courier New"
+FONT_UI    = "Segoe UI" if os.name == "nt" else "SF Pro Display"
 
 SLOT_TOKEN_MAP = {1: 1, 2: 2, 3: 1, 4: 2}
 
@@ -267,7 +279,7 @@ class App(tk.Tk):
         self.title("MI Bootloader Unlock Tool")
         self.configure(bg=COLORS["bg"])
         self.resizable(True, True)
-        self.minsize(900, 640)
+        self.minsize(960, 660)
 
         self._stop_event = threading.Event()
         self._workers    = []
@@ -343,7 +355,9 @@ class App(tk.Tk):
         self._stop_event.clear()
         self._workers.clear()
         self._run_btn.configure(state="disabled")
-        self._stop_btn.configure(state="normal")
+        self._stop_btn.configure(state="normal",
+                                 bg=COLORS["error"], fg="white",
+                                 activebackground="#be123c")
 
         tokens = {1: t1, 2: t2}
         cfg = {
@@ -377,7 +391,10 @@ class App(tk.Tk):
         self._stop_event.set()
         self._log("warn", "Stop requested — workers will halt at next checkpoint.")
         self._run_btn.configure(state="normal")
-        self._stop_btn.configure(state="disabled")
+        self._stop_btn.configure(state="disabled",
+                                 bg=COLORS["border"], fg=COLORS["text_dim"],
+                                 activebackground=COLORS["error"],
+                                 activeforeground="white")
 
     def _on_window_close(self):
         self._on_stop()
@@ -392,53 +409,79 @@ class App(tk.Tk):
     def _build_ui(self):
         C = COLORS
 
-        hdr = tk.Frame(self, bg=C["panel"], height=52)
+        hdr = tk.Frame(self, bg=C["header_bg"], height=62)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
 
-        tk.Label(hdr, text="MI  BOOTLOADER  UNLOCK",
-                 bg=C["panel"], fg=C["accent"],
-                 font=("Courier New", 15, "bold")).pack(side="left", padx=18, pady=12)
+        left_hdr = tk.Frame(hdr, bg=C["header_bg"])
+        left_hdr.pack(side="left", padx=20, pady=0, fill="y")
 
+        badge = tk.Label(left_hdr, text=" MI ", bg=C["accent"], fg="white",
+                         font=(FONT_MONO, 11, "bold"), relief="flat", pady=2)
+        badge.pack(side="left", padx=(0, 12), pady=16)
+
+        title_frame = tk.Frame(left_hdr, bg=C["header_bg"])
+        title_frame.pack(side="left", fill="y", pady=12)
+        tk.Label(title_frame, text="Bootloader Unlock Tool",
+                 bg=C["header_bg"], fg=C["text"],
+                 font=(FONT_UI, 13, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Xiaomi Global · SGP API",
+                 bg=C["header_bg"], fg=C["muted"],
+                 font=(FONT_UI, 8)).pack(anchor="w")
+
+        right_hdr = tk.Frame(hdr, bg=C["header_bg"])
+        right_hdr.pack(side="right", padx=20, fill="y")
         self._clock_var = tk.StringVar(value="")
-        tk.Label(hdr, textvariable=self._clock_var,
-                 bg=C["panel"], fg=C["accent2"],
-                 font=("Courier New", 11)).pack(side="right", padx=18)
+        tk.Label(right_hdr, text="LOCAL TIME IN",
+                 bg=C["header_bg"], fg=C["muted"],
+                 font=(FONT_UI, 7, "bold")).pack(anchor="e", pady=(14, 0))
+        tk.Label(right_hdr, textvariable=self._clock_var,
+                 bg=C["header_bg"], fg=C["accent2"],
+                 font=(FONT_MONO, 13, "bold")).pack(anchor="e")
 
-        sep = tk.Frame(self, bg=C["border"], height=1)
-        sep.pack(fill="x")
+        tk.Frame(self, bg=C["accent"], height=2).pack(fill="x")
 
         body = tk.Frame(self, bg=C["bg"])
-        body.pack(fill="both", expand=True, padx=0, pady=0)
+        body.pack(fill="both", expand=True)
 
-        left  = tk.Frame(body, bg=C["bg"], width=300)
-        left.pack(side="left", fill="y", padx=0)
-        left.pack_propagate(False)
+        paned = tk.PanedWindow(body, orient="horizontal",
+                               bg=C["border"],
+                               sashwidth=5,
+                               sashrelief="flat",
+                               opaqueresize=True,
+                               handlesize=0)
+        paned.pack(fill="both", expand=True)
 
-        right = tk.Frame(body, bg=C["bg"])
-        right.pack(side="left", fill="both", expand=True)
+        left = tk.Frame(paned, bg=C["bg"])
+        right = tk.Frame(paned, bg=C["bg"])
+
+        paned.add(left,  minsize=260, width=320, stretch="never")
+        paned.add(right, minsize=400, stretch="always")
 
         self._build_config(left)
-
         self._build_slots_and_log(right)
 
 
     def _section(self, parent, title):
-        f = tk.Frame(parent, bg=COLORS["panel"],
-                     highlightbackground=COLORS["border"],
-                     highlightthickness=1)
-        f.pack(fill="x", padx=10, pady=(10, 0))
-        tk.Label(f, text=title, bg=COLORS["panel"], fg=COLORS["accent"],
-                 font=("Courier New", 9, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
-        inner = tk.Frame(f, bg=COLORS["panel"])
-        inner.pack(fill="x", padx=8, pady=(0, 8))
+        outer = tk.Frame(parent, bg=COLORS["panel"],
+                         highlightbackground=COLORS["border_light"],
+                         highlightthickness=1)
+        outer.pack(fill="x", padx=10, pady=(10, 0))
+        accent_bar = tk.Frame(outer, bg=COLORS["accent"], width=3)
+        accent_bar.pack(side="left", fill="y")
+        content = tk.Frame(outer, bg=COLORS["panel"])
+        content.pack(side="left", fill="both", expand=True)
+        tk.Label(content, text=title, bg=COLORS["panel"], fg=COLORS["text_dim"],
+                 font=(FONT_UI, 8, "bold")).pack(anchor="w", padx=10, pady=(7, 2))
+        inner = tk.Frame(content, bg=COLORS["panel"])
+        inner.pack(fill="x", padx=10, pady=(0, 10))
         return inner
 
     def _row(self, parent, label, widget_factory):
         row = tk.Frame(parent, bg=COLORS["panel"])
-        row.pack(fill="x", pady=2)
-        tk.Label(row, text=label, bg=COLORS["panel"], fg=COLORS["muted"],
-                 font=("Courier New", 8), width=18, anchor="w").pack(side="left")
+        row.pack(fill="x", pady=3)
+        tk.Label(row, text=label, bg=COLORS["panel"], fg=COLORS["text_dim"],
+                 font=(FONT_UI, 8), width=20, anchor="w").pack(side="left")
         w = widget_factory(row)
         w.pack(side="left", fill="x", expand=True)
         return w
@@ -446,17 +489,20 @@ class App(tk.Tk):
     def _entry(self, parent, textvariable, **kw):
         return tk.Entry(parent, textvariable=textvariable,
                         bg=COLORS["input_bg"], fg=COLORS["text"],
-                        insertbackground=COLORS["text"],
-                        relief="flat", font=("Courier New", 9),
-                        highlightbackground=COLORS["border"],
+                        insertbackground=COLORS["accent"],
+                        relief="flat", font=(FONT_MONO, 9),
+                        highlightbackground=COLORS["border_light"],
+                        highlightcolor=COLORS["accent2"],
                         highlightthickness=1, **kw)
 
     def _spinbox(self, parent, var, from_, to, width=7):
         return tk.Spinbox(parent, textvariable=var,
                           from_=from_, to=to, width=width,
                           bg=COLORS["input_bg"], fg=COLORS["text"],
-                          buttonbackground=COLORS["border"],
-                          relief="flat", font=("Courier New", 9))
+                          buttonbackground=COLORS["border_light"],
+                          relief="flat", font=(FONT_MONO, 9),
+                          highlightbackground=COLORS["border_light"],
+                          highlightthickness=1)
 
     def _build_config(self, parent):
         C = COLORS
@@ -493,35 +539,46 @@ class App(tk.Tk):
 
         btn_row = tk.Frame(sec, bg=C["panel"])
         btn_row.pack(fill="x", pady=(4, 0))
-        tk.Button(btn_row, text="Show / Hide",
-                  bg=C["border"], fg=C["text"], relief="flat",
-                  font=("Courier New", 8), cursor="hand2",
-                  command=self._toggle_token_vis).pack(side="left", padx=(0, 4))
-        tk.Button(btn_row, text="Save",
-                  bg=C["border"], fg=C["text"], relief="flat",
-                  font=("Courier New", 8), cursor="hand2",
+        tk.Button(btn_row, text="👁  Show/Hide",
+                  bg=C["border_light"], fg=C["text_dim"],
+                  activebackground=C["accent2_dim"],
+                  activeforeground=C["text"],
+                  relief="flat", font=(FONT_UI, 8),
+                  cursor="hand2", padx=6, pady=3,
+                  command=self._toggle_token_vis).pack(side="left", padx=(0, 6))
+        tk.Button(btn_row, text="💾  Save",
+                  bg=C["accent2_dim"], fg=C["text"],
+                  activebackground=C["accent2"],
+                  activeforeground="white",
+                  relief="flat", font=(FONT_UI, 8, "bold"),
+                  cursor="hand2", padx=6, pady=3,
                   command=self._save_tokens).pack(side="left")
 
         sec2 = self._section(inner, "ENABLED SLOTS")
         self._slot_enabled = [tk.BooleanVar(value=True) for _ in range(4)]
         sf = tk.Frame(sec2, bg=C["panel"])
         sf.pack(fill="x")
+        sf.columnconfigure(0, weight=1)
+        sf.columnconfigure(1, weight=1)
         for i in range(4):
+            r, c = divmod(i, 2)
             tk.Checkbutton(sf, text=f"Slot {i+1}",
                            variable=self._slot_enabled[i],
                            bg=C["panel"], fg=C["text"],
-                           selectcolor=C["input_bg"],
+                           selectcolor=C["accent_dim"],
                            activebackground=C["panel"],
-                           font=("Courier New", 8)).pack(side="left", padx=4)
+                           activeforeground=C["accent"],
+                           font=(FONT_UI, 9)).grid(row=r, column=c, sticky="w", padx=6, pady=2)
 
         sec3 = self._section(inner, "TIMING")
         self._skip_timing_var = tk.BooleanVar(value=False)
         tk.Checkbutton(sec3, text="Manual fire time (skip auto-midnight)",
                        variable=self._skip_timing_var,
                        bg=C["panel"], fg=C["text"],
-                       selectcolor=C["input_bg"],
+                       selectcolor=C["accent_dim"],
                        activebackground=C["panel"],
-                       font=("Courier New", 8),
+                       activeforeground=C["accent"],
+                       font=(FONT_UI, 9),
                        command=self._toggle_manual_time).pack(anchor="w")
 
         self._manual_frame = tk.Frame(sec3, bg=C["panel"])
@@ -534,8 +591,8 @@ class App(tk.Tk):
         for label, var, hi in [("HH", self._fire_hour_var, 23),
                                 ("MM", self._fire_min_var,  59),
                                 ("SS", self._fire_sec_var,  59)]:
-            tk.Label(hf, text=label, bg=C["panel"], fg=C["muted"],
-                     font=("Courier New", 8)).pack(side="left", padx=(4,0))
+            tk.Label(hf, text=label, bg=C["panel"], fg=C["text_dim"],
+                     font=(FONT_UI, 8, "bold")).pack(side="left", padx=(6,2))
             self._spinbox(hf, var, 0, hi, width=4).pack(side="left", padx=2)
         self._toggle_manual_time()
 
@@ -557,16 +614,19 @@ class App(tk.Tk):
         self._run_btn = tk.Button(btn_sec, text="▶  RUN",
                                   bg=C["accent"], fg="white",
                                   activebackground="#ea6810",
-                                  font=("Courier New", 11, "bold"),
+                                  font=(FONT_UI, 11, "bold"),
                                   relief="flat", cursor="hand2",
+                                  pady=8,
                                   command=self._on_run)
-        self._run_btn.pack(fill="x", pady=(0, 4))
+        self._run_btn.pack(fill="x", pady=(0, 6))
 
         self._stop_btn = tk.Button(btn_sec, text="■  STOP",
-                                   bg=C["error"], fg="white",
-                                   activebackground="#dc2626",
-                                   font=("Courier New", 11, "bold"),
+                                   bg=C["border"], fg=C["text_dim"],
+                                   activebackground=C["error"],
+                                   activeforeground="white",
+                                   font=(FONT_UI, 11, "bold"),
                                    relief="flat", cursor="hand2",
+                                   pady=8,
                                    state="disabled",
                                    command=self._on_stop)
         self._stop_btn.pack(fill="x")
@@ -600,44 +660,55 @@ class App(tk.Tk):
         for i in range(4):
             r, c  = divmod(i, 2)
             pane  = tk.Frame(slot_frame, bg=C["panel"],
-                             highlightbackground=C["border"],
+                             highlightbackground=C["border_light"],
                              highlightthickness=1)
             pane.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
 
-            tk.Label(pane, text=f"SLOT  {i+1}",
-                     bg=C["panel"], fg=C["accent"],
-                     font=("Courier New", 10, "bold")).pack(anchor="w", padx=8, pady=(6, 0))
+            hrow = tk.Frame(pane, bg=C["panel"])
+            hrow.pack(fill="x", padx=8, pady=(8, 0))
+            slot_badge = tk.Label(hrow, text=f"{i+1}",
+                                  bg=C["accent"], fg="white",
+                                  font=(FONT_MONO, 9, "bold"), width=2, pady=1)
+            slot_badge.pack(side="left", padx=(0, 6))
+            tk.Label(hrow, text=f"SLOT {i+1}",
+                     bg=C["panel"], fg=C["text"],
+                     font=(FONT_UI, 10, "bold")).pack(side="left", anchor="w")
 
             tk.Label(pane,
                      text=f"Token #{SLOT_TOKEN_MAP[i+1]}",
                      bg=C["panel"], fg=C["muted"],
-                     font=("Courier New", 8)).pack(anchor="w", padx=8)
+                     font=(FONT_UI, 8)).pack(anchor="w", padx=8)
 
-            tk.Label(pane, textvariable=self._slot_status[i],
+            status_lbl = tk.Label(pane, textvariable=self._slot_status[i],
                      bg=C["panel"], fg=C["accent2"],
-                     font=("Courier New", 9, "bold")).pack(anchor="w", padx=8, pady=(2, 6))
+                     font=(FONT_MONO, 9, "bold"))
+            status_lbl.pack(anchor="w", padx=8, pady=(2, 8))
 
         log_header = tk.Frame(parent, bg=C["bg"])
-        log_header.pack(fill="x", padx=10)
+        log_header.pack(fill="x", padx=10, pady=(6, 2))
         tk.Label(log_header, text="LIVE LOG",
-                 bg=C["bg"], fg=C["muted"],
-                 font=("Courier New", 9, "bold")).pack(side="left")
-        tk.Button(log_header, text="clear",
-                  bg=C["bg"], fg=C["muted"],
-                  relief="flat", font=("Courier New", 8),
-                  cursor="hand2",
+                 bg=C["bg"], fg=C["text_dim"],
+                 font=(FONT_UI, 9, "bold")).pack(side="left")
+        tk.Button(log_header, text="✕ Clear",
+                  bg=C["border"], fg=C["text_dim"],
+                  activebackground=C["border_light"],
+                  activeforeground=C["text"],
+                  relief="flat", font=(FONT_UI, 8),
+                  cursor="hand2", padx=6, pady=2,
                   command=self._on_clear_log).pack(side="right")
 
         self._log_box = scrolledtext.ScrolledText(
             parent, state="disabled", wrap="word",
             bg=C["input_bg"], fg=C["text"],
-            font=("Courier New", 8),
+            font=(FONT_MONO, 8),
             relief="flat",
-            insertbackground=C["text"],
-            selectbackground=C["accent2"],
+            insertbackground=C["accent"],
+            selectbackground=C["accent2_dim"],
+            selectforeground=C["text"],
             height=22,
+            padx=8, pady=6,
         )
-        self._log_box.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+        self._log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         for tag, color in [("ok",    C["success"]),
                            ("info",  C["text"]),
@@ -645,6 +716,8 @@ class App(tk.Tk):
                            ("error", C["error"]),
                            ("debug", C["muted"])]:
             self._log_box.tag_configure(tag, foreground=color)
+        self._log_box.tag_configure("ok",    font=(FONT_MONO, 8, "bold"))
+        self._log_box.tag_configure("error", font=(FONT_MONO, 8, "bold"))
 
         self._log("info", "GUI loaded. Fill tokens, configure, then press RUN.")
 
