@@ -1,4 +1,4 @@
-# 🔓 MI Bootloader Unlock Tool (Android / Termux)
+# 🔓 MI Bootloader Unlock Tool (Android / Termux / Linux / Windows)
 
 A **phone-only automation tool** to send Xiaomi bootloader unlock requests using **Termux**, with **4 parallel windows** and **only 2 tokens**.
 

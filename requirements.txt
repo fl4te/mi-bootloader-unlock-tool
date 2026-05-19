@@ -1,0 +1,4 @@
+colorama
+ntplib
+pytz
+urllib3

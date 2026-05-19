@@ -1,132 +1,234 @@
 #!/usr/bin/env python3
 
-# =========================
-# CONFIG - BEIJING TIMES ONLY
-# =========================
-SKIP_TIMING = False          # False=next midnight, True=manual
-MANUAL_FIRE_HOUR = 19        # Beijing hour
-MANUAL_FIRE_MIN = 37         # Beijing minute  
-MANUAL_FIRE_SEC = 0          # Beijing second
-OFFSET_MS = 120              # First shot Xms BEFORE midnight
-BURST_INTERVAL_MS = 50       # 50ms between shots
+SKIP_TIMING = False          
+MANUAL_FIRE_HOUR = 19        
+MANUAL_FIRE_MIN = 37         
+MANUAL_FIRE_SEC = 0          
 
-# =========================
-# IMPORTS
-# =========================
-import subprocess, sys, os, time, json, hashlib, random, linecache, signal
+OFFSET_MS = 120              
+BURST_INTERVAL_MS = 50       
+BURST_COUNT = 10             
+
+DEBUG = True                 
+SHOW_COUNTDOWN = True        
+COUNTDOWN_REFRESH_MS = 100   
+SHOW_DRIFT = True            
+
+import subprocess
+import sys
+import os
+import time
+import json
+import hashlib
+import random
+import linecache
+import signal
+import ctypes
+
 from datetime import datetime, timezone, timedelta
-import ntplib, pytz, urllib3
+
+import ntplib
+import pytz
+import urllib3
+
 from colorama import init, Fore, Style
 
-# =========================
-# AUTO INSTALL
-# =========================
+if os.name == "nt":
+    ctypes.windll.winmm.timeBeginPeriod(1)
+
 def install(pkg):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", pkg]
+    )
 
 for p in ("ntplib", "pytz", "urllib3", "colorama"):
-    try: __import__(p)
-    except: install(p)
+    try:
+        __import__(p)
+    except:
+        install(p)
 
-# =========================
-# SETUP
-# =========================
-init(autoreset=True)
-G, Y, R, B, GB = Fore.GREEN, Fore.YELLOW, Fore.RED, Fore.BLUE, Style.BRIGHT + Fore.GREEN
-def clear(): os.system("cls" if os.name == "nt" else "clear")
+init(autoreset=True)  
+
+G = Fore.GREEN
+Y = Fore.YELLOW
+R = Fore.RED
+B = Fore.BLUE
+C = Fore.CYAN
+GB = Style.BRIGHT + Fore.GREEN
+
+TZ_BEIJING = pytz.timezone("Asia/Shanghai")
+
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
 
 clear()
 
-# Ctrl+C handler
+def log_info(msg):  print(f"{B}[INFO]{Fore.RESET} {msg}")
+def log_ok(msg):    print(f"{G}[OK]{Fore.RESET} {msg}")
+def log_warn(msg):  print(f"{Y}[WARN]{Fore.RESET} {msg}")
+def log_err(msg):   print(f"{R}[ERR]{Fore.RESET} {msg}")
+def log_debug(msg):
+    if DEBUG:       print(f"{C}[DEBUG]{Fore.RESET} {msg}")
+
 def signal_handler(sig, frame):
-    print(f'\n{R}[!] Interrupted - Clean exit'); sys.exit(0)
+    print(f'\n{R}[!] Interrupted - Clean exit')
+    sys.exit(0)
+
 signal.signal(signal.SIGINT, signal_handler)
 
-# =========================
-# BEIJING TIME
-# =========================
-def show_beijing_time():
-    beijing = datetime.now(timezone.utc).astimezone(pytz.timezone("Asia/Shanghai"))
-    print(f'{B}[BEIJING] {beijing.strftime("%H:%M:%S.%f")[:-3]}{Fore.RESET}')
+def now_beijing():
+    return datetime.now(timezone.utc).astimezone(TZ_BEIJING)
 
-# =========================
-# USER INPUT
-# =========================
+def show_beijing_time(prefix="[BEIJING]"):
+    bt = now_beijing()
+    print(
+        f"{B}{prefix} "
+        f"{bt.strftime('%H:%M:%S.%f')[:-3]}"
+        f"{Fore.RESET}"
+    )
+
 show_beijing_time()
+
 slot = int(input(f'{G}[Slot 1-4]: '))
-token_num = 1 if slot in (1, 3) else 2 if slot in (2, 4) else None
-if not token_num: print(f'{R}Invalid slot'); sys.exit(1)
 
-clear(); show_beijing_time()
-print(f'{GB}Token #{token_num}')
-token = linecache.getline("token.txt", token_num).strip()
-if not token: print(f'{R}No token'); sys.exit(1)
+token_num = (
+    1 if slot in (1, 3)
+    else 2 if slot in (2, 4)
+    else None
+)
 
-# =========================
-# CONSTANTS
-# =========================
+if not token_num:
+    log_err("Invalid slot selection")
+    sys.exit(1)
+
+clear()
+show_beijing_time()
+print(f'{GB}Token Assignment #{token_num}')
+
+token = linecache.getline(
+    "token.txt",
+    token_num
+).strip()
+
+if not token:
+    log_err("Target slot credential array is blank or file is missing")
+    sys.exit(1)
+
 URL_STATUS = "https://sgp-api.buy.mi.com/bbs/api/global/user/bl-switch/state"
 URL_APPLY = "https://sgp-api.buy.mi.com/bbs/api/global/apply/bl-auth"
-UA = "okhttp/4.12.0"
-NTP_SERVERS = ["ntp0.ntp-servers.net", "ntp1.ntp-servers.net", "ntp2.ntp-servers.net"]
 
-# =========================
-# HELPERS
-# =========================
-def gen_device_id(): return hashlib.sha1(f"{random.random()}-{time.time()}".encode()).hexdigest().upper()
+UA = "okhttp/4.12.0"  
+
+NTP_SERVERS = [
+    "ntp0.ntp-servers.net",
+    "ntp1.ntp-servers.net",
+    "ntp2.ntp-servers.net"
+]
+
+def gen_device_id():
+    return hashlib.sha1(
+        f"{random.random()}-{time.time()}".encode()
+    ).hexdigest().upper()
+
+def format_remaining(seconds):
+    if seconds < 0:
+        seconds = 0
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{hrs:02}:{mins:02}:{secs:02}.{ms:03}"
 
 def get_ntp_beijing():
-    tz = pytz.timezone("Asia/Shanghai"); c = ntplib.NTPClient()
-    for s in NTP_SERVERS:
+    client = ntplib.NTPClient()
+
+    for server in NTP_SERVERS:
         try:
-            r = c.request(s, version=3, timeout=3)
-            bt = datetime.fromtimestamp(r.tx_time, timezone.utc).astimezone(tz)
-            print(f'{G}[NTP] {bt.strftime("%H:%M:%S.%f")[:-3]}{Fore.RESET}'); return bt
-        except: pass
-    bt = datetime.now(timezone.utc).astimezone(tz)
-    print(f'{Y}[SYS] {bt.strftime("%H:%M:%S.%f")[:-3]}{Fore.RESET}'); return bt
+            start = time.perf_counter()
+            r = client.request(server, version=3, timeout=3)
+            latency = (time.perf_counter() - start) * 1000
 
-def synced_time(start_bt, start_ts): 
-    return start_bt + timedelta(seconds=(time.time() - start_ts))
+            bt = datetime.fromtimestamp(
+                r.tx_time,
+                timezone.utc
+            ).astimezone(TZ_BEIJING)
 
-# =========================
-# PERFECT TIMING
-# =========================
+            log_ok(f"NTP sync from {server} ({latency:.2f}ms)")
+            log_debug(f"NTP offset={r.offset * 1000:.2f}ms | delay={r.delay * 1000:.2f}ms")
+            print(f"{G}[NTP] {bt.strftime('%H:%M:%S.%f')[:-3]}{Fore.RESET}")
+            return bt
+
+        except Exception as e:
+            log_warn(f"NTP sync failure: {server} ({e})")
+
+    bt = now_beijing()
+    log_warn("Falling back to local OS system clock authority")
+    print(f"{Y}[SYS] {bt.strftime('%H:%M:%S.%f')[:-3]}{Fore.RESET}")
+    return bt
+
+def synced_time(start_bt, start_perf):
+    elapsed = (time.perf_counter() - start_perf)
+    return start_bt + timedelta(seconds=elapsed)
+
 def get_target(start_bt):
     if SKIP_TIMING:
-        target = start_bt.replace(hour=MANUAL_FIRE_HOUR, minute=MANUAL_FIRE_MIN, 
-                                second=MANUAL_FIRE_SEC, microsecond=0)
-        print(f'{Y}[MANUAL] {target.strftime("%H:%M:%S Beijing")}')
+        target = start_bt.replace(
+            hour=MANUAL_FIRE_HOUR,
+            minute=MANUAL_FIRE_MIN,
+            second=MANUAL_FIRE_SEC,
+            microsecond=0
+        )
+        log_warn(f"Manual override scheduler set: {target.strftime('%H:%M:%S Beijing')}")
         return target
-    target = (start_bt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    print(f'{Y}[AUTO] Midnight target: {target.strftime("%H:%M:%S Beijing")}')
+
+    target = (start_bt + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    log_warn(f"Auto-midnight baseline computed: {target.strftime('%Y-%m-%d %H:%M:%S Beijing')}")
     return target
 
-def wait_target(start_bt, start_ts, target):
-    print(f'{Y}Waiting for exact target...'); last_show = 0
+def wait_target(start_bt, start_perf, target):
+    log_info("Waiting for target window initialization...")
+    last_print = 0
+
     while True:
-        now = synced_time(start_bt, start_ts)
+        now = synced_time(start_bt, start_perf)
         diff = (target - now).total_seconds()
-        if time.time() - last_show > 1: 
-            show_beijing_time(); last_show = time.time()
-        if diff > 0.01: 
-            time.sleep(min(diff-0.005, 0.1))
-        elif diff > 0: 
-            time.sleep(0.0001)
-        else: 
+
+        if SHOW_COUNTDOWN:
+            current = time.perf_counter()
+            if current - last_print >= (COUNTDOWN_REFRESH_MS / 1000):
+                real_bt = now_beijing()
+                drift = (real_bt - now).total_seconds() * 1000
+                line = f"\r{Y}T-minus: {format_remaining(diff)} "
+                if SHOW_DRIFT:
+                    line += f"| Drift: {drift:+.2f}ms "
+                print(line, end="", flush=True)
+                last_print = current
+
+        if diff <= 0:  
             break
 
-# =========================
-# HTTP SESSION
-# =========================
+        if diff > 1:        time.sleep(0.25)     
+        elif diff > 0.1:    time.sleep(0.01)     
+        elif diff > 0.01:   time.sleep(0.001)    
+        else:               time.sleep(0.0001)   
+
+    print()
+    log_ok("Target threshold cleared.")
+
 class Session:
     def __init__(self):
         self.http = urllib3.PoolManager(
-            maxsize=10, 
-            retries=urllib3.Retry(total=1, backoff_factor=0),
-            timeout=urllib3.Timeout(connect=2.0, read=5.0)
+            maxsize=10,                      
+            retries=urllib3.Retry(           
+                total=1, backoff_factor=0
+            ),
+            timeout=urllib3.Timeout(         
+                connect=2.0, read=5.0
+            )
         )
-    
+
     def request(self, method, url, headers=None, body=None):
         try:
             h = headers or {}
@@ -136,100 +238,182 @@ class Session:
                     'Content-Type': 'application/json',
                     'Content-Length': str(len(body)),
                     'User-Agent': UA,
-                    'Connection': 'keep-alive',
+                    'Connection': 'keep-alive', 
                     'Accept-Encoding': 'gzip'
                 })
-            return self.http.request(method, url, headers=h, body=body, preload_content=False)
-        except KeyboardInterrupt: raise
-        except: print(f'{R}[HTTP ERR]'); return None
 
-# =========================
-# STATUS & FIRE
-# =========================
+            return self.http.request(
+                method, url, headers=h, body=body,
+                preload_content=False  
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log_err(f"HTTP Socket exception caught: {e}")
+            return None
+
 def check_status(session, token, device_id):
-    h = {"Cookie": f"new_bbs_serviceToken={token};versionCode=500411;versionName=5.4.11;deviceId={device_id};"}
+    h = {
+        "Cookie": f"new_bbs_serviceToken={token}; versionCode=500411; versionName=5.4.11; deviceId={device_id};"
+    }
+    start = time.perf_counter()
     r = session.request('GET', URL_STATUS, headers=h)
-    if not r: return False
+    latency = (time.perf_counter() - start) * 1000
+
+    if not r:
+        return False
+
     try:
-        data = json.loads(r.data.decode('utf-8')); r.release_conn()
-        if data.get("code") == 100004: print(f'{R}Token expired!'); sys.exit(1)
+        raw = r.data.decode('utf-8')
+        data = json.loads(raw)
+
+        try:    r.close()
+        except: r.release_conn()
+
+        log_debug(f"Status validation latency: {latency:.2f}ms")
+        log_debug(f"Status payload: {raw}")
+
+        if data.get("code") == 100004:
+            log_err("Authentication token is expired or structurally invalid.")
+            sys.exit(1)
+
         info = data.get("data", {})
-        is_pass, button = info.get("is_pass"), info.get("button_state")
-        print(f'{G}[Status]: ', end='')
-        if is_pass == 4 and button == 1: print(f'{GB}READY!'); return True
-        elif is_pass == 1: print(f'{GB}Already approved!'); sys.exit(0)
-        else: print(f'{R}Not ready'); sys.exit(1)
-    except: return False
+        is_pass = info.get("is_pass")
+        button = info.get("button_state")
+
+        print(f'{G}[Status Verification]: ', end='')
+
+        if is_pass == 4 and button == 1:
+            print(f'{GB}READY FOR BURST APPLICATION INTERFACE')
+            return True
+        elif is_pass == 1:
+            print(f'{GB}System Account is already approved!')
+            sys.exit(0)
+        else:
+            print(f'{R}Verification rejected. Criteria unmet or window closed (Code states: Pass={is_pass} | Btn={button})')
+            sys.exit(1)
+
+    except Exception as e:
+        log_err(f"Status decoder error: {e}")
+        return False
 
 def fire(session, token, device_id):
-    h = {"Cookie": f"new_bbs_serviceToken={token};versionCode=500411;versionName=5.4.11;deviceId={device_id};"}
+    h = {
+        "Cookie": f"new_bbs_serviceToken={token}; versionCode=500411; versionName=5.4.11; deviceId={device_id};"
+    }
     try:
+        start = time.perf_counter()
         r = session.request("POST", URL_APPLY, headers=h)
-        if not r: return None
-        data = json.loads(r.data.decode('utf-8')); r.release_conn()
+        latency = (time.perf_counter() - start) * 1000
+
+        if not r:
+            log_err(f"Network transport pipeline lost drop state ({latency:.2f}ms)")
+            return None
+
+        raw = r.data.decode('utf-8')
+        data = json.loads(raw)
+
+        try:    r.close()
+        except: r.release_conn()
+
+        log_debug(f"HTTP roundtrip transit time: {latency:.2f}ms")
+        log_debug(f"Server response payload: {raw}")
         return data
-    except KeyboardInterrupt: raise
-    except: return None
+
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        log_err(f"Fire context exception: {e}")
+        return None
 
 def handle_resp(resp):
-    if resp.get("code") != 0: print(f'{R}❌ API ERR'); return False
-    result = resp.get("data", {}).get("apply_result")
-    deadline = resp.get("data", {}).get("deadline_format", "")
-    if result == 1: print(f'{GB}✅ APPROVED! 🎉'); return True
-    elif result == 3: print(f'{Y}⏳ QUOTA: {deadline}'); return False
-    elif result == 4: print(f'{R}⛔ BLOCKED: {deadline}'); return False
-    else: print(f'{R}❓ {resp}'); return False
+    code = resp.get("code")
 
-# =========================
-# MAIN - PERFECT STAGGERED BURST
-# =========================
+    if code != 0:
+        log_err(f"API rejection edge: return code={code}")
+        log_debug(json.dumps(resp, indent=2))
+        return False
+
+    data = resp.get("data", {})
+    result = data.get("apply_result")
+    deadline = data.get("deadline_format", "")
+
+    log_debug(f"Target query state mapped: apply_result={result}")
+
+    if result == 1:
+        log_ok("APPROVAL SEEDED SUCCESSFULLY 🎉")
+        return True
+    elif result == 3:
+        log_warn(f"Server capacity exhausted. Quota limit reached until: {deadline}")
+        return False
+    elif result == 4:
+        log_err(f"Account security velocity threshold hit. Blocked until: {deadline}")
+        return False
+    else:
+        log_warn(f"Unmapped fallback code state received: {resp}")
+        return False
+
 def main():
     device_id = gen_device_id()
     session = Session()
-    
-    print(f'{Y}🔍 Checking status...'); clear()
-    if not check_status(session, token, device_id): return
-    
+
+    log_info("Running credential check and API endpoint validations...")
+    if not check_status(session, token, device_id):
+        return
+
     start_bt = get_ntp_beijing()
-    start_ts = time.time()
+    start_perf = time.perf_counter()
+
     target = get_target(start_bt)
     
-    # Wait for EXACT target time (midnight/OFFSET_MS)
-    wait_target(start_bt, start_ts, target - timedelta(milliseconds=OFFSET_MS))
-    
-    clear(); show_beijing_time()
-    print(f'{GB}🚀 PRECISE 10x BURST STARTS NOW!{Fore.RESET}\n')
-    
+    fire_start = target - timedelta(milliseconds=OFFSET_MS)
+
+    wait_target(start_bt, start_perf, fire_start)
+
+    clear()
+    show_beijing_time()
+    print(f'{GB}🚀 PRECISE BURST ENGINE DEPLOYED NOW!\n')
+
     success = False
+
     try:
-        for i in range(10):
-            # PERFECT TIMING: shot i fires at target + (i * 50ms)
+        for i in range(BURST_COUNT):
             shot_target = target + timedelta(milliseconds=i * BURST_INTERVAL_MS)
-            
-            # Wait precisely for THIS shot's exact time
+
             while True:
-                shot_time = synced_time(start_bt, start_ts)
+                shot_time = synced_time(start_bt, start_perf)
                 diff = (shot_target - shot_time).total_seconds()
-                if diff <= 0: break
-                time.sleep(diff * 0.8)  # Micro-sleep
-            
-            # FIRE at EXACT millisecond
-            now_beijing = datetime.now(timezone.utc).astimezone(pytz.timezone("Asia/Shanghai"))
-            print(f'[{i+1}/10] ', end='')
+
+                if diff <= 0:  
+                    break
+                
+                time.sleep(max(diff * 0.7, 0.0001))
+
+            actual_fire = synced_time(start_bt, start_perf)
+            timing_error = (actual_fire - shot_target).total_seconds() * 1000
+
+            print(
+                f"{B}[SHOT {i+1:02}/{BURST_COUNT:02}]{Fore.RESET} "
+                f"Target={shot_target.strftime('%H:%M:%S.%f')[:-3]} "
+                f"| Actual={actual_fire.strftime('%H:%M:%S.%f')[:-3]} "
+                f"| Error={timing_error:+.2f}ms"
+            )
+
             resp = fire(session, token, device_id)
-            
+
             if resp:
-                print(f'{B}@{now_beijing.strftime("%H:%M:%S.%f")}{Fore.RESET} ', end='')
                 if handle_resp(resp):
                     success = True
-                    print(f'\n{GB}🎉 SUCCESS on shot {i+1}!')
-                    break
-            
-    except KeyboardInterrupt: 
-        print(f'\n{Y}[!] Burst interrupted')
-    
-    if not success:
-        print(f'{R}\n❌ Burst complete - No approval')
-    print(f'{Y}[*] Next quota: 00:00 Beijing tomorrow')
+                    log_ok(f"BURST PIPELINE RESOLVED ON SHOT APPLICATION POSITION #{i+1}")
+                    break  
 
-if __name__ == "__main__": main()
+    except KeyboardInterrupt:
+        log_warn("High-frequency execution matrix halted via manual interrupt rules.")
+
+    if not success:
+        print(f'{R}\n❌ Precise loop sequence completed. Allocation window closed without approval.')
+
+    print(f'{Y}[*] Next open server pool cycle resets at: 00:00 Beijing time tomorrow.\n')
+
+if __name__ == "__main__":
+    main()
