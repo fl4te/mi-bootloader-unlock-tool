@@ -146,6 +146,15 @@ def _release(r):
     except Exception:
         pass
 
+def retry_api(func, max_retries=3, delay=0.5):
+    for i in range(max_retries):
+        try:
+            return func()
+        except Exception:
+            if i == max_retries - 1:
+                raise
+            time.sleep(delay)
+
 def measure_latency(session, token, device_id, log_cb):
     try:
         start = time.perf_counter()
@@ -216,6 +225,12 @@ def handle_resp(resp, log_cb):
     data     = resp.get("data", {})
     result   = data.get("apply_result")
     deadline = data.get("deadline_format", "")
+
+    server_ts = resp.get("ts", 0)
+    if server_ts:
+        server_time = datetime.fromtimestamp(server_ts, timezone.utc).astimezone(TZ_BEIJING)
+        log_cb("debug", f"Server response at: {server_time.strftime('%H:%M:%S.%f')[:-3]} Beijing")
+
     if result == 1:
         log_cb("ok",   "APPROVAL GRANTED SUCCESSFULLY")
         return True
@@ -236,6 +251,7 @@ class SlotWorker:
         self.set_status = status_cb
         self.stop       = stop_event
         self.thread     = threading.Thread(target=self._run, daemon=True)
+        self._warmed    = False
 
     def start(self):
         self.thread.start()
@@ -264,11 +280,12 @@ class SlotWorker:
                 target += timedelta(days=1)
             self.log("warn", f"[Slot {slot}] Manual target: {target.strftime('%d.%m.%Y %H:%M:%S Beijing')}")
         else:
+            delay_ms = cfg.get("delay_ms", cfg["offset_ms"])
             target = (start_bt + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0)
+                hour=0, minute=0, second=0, microsecond=0) - timedelta(milliseconds=delay_ms)
             self.log("warn", f"[Slot {slot}] Auto target: {target.strftime('%d.%m.%Y %H:%M:%S Beijing')}")
 
-        fire_start = target - timedelta(milliseconds=cfg["offset_ms"])
+        fire_start = target
 
         self.set_status("waiting")
         self.log("info", f"[Slot {slot}] Waiting for fire window…")
@@ -279,6 +296,12 @@ class SlotWorker:
             self.set_status(f"T-{format_remaining(diff)}")
             if diff <= 0:
                 break
+            if cfg.get("warmup_enabled", True) and diff <= 10 and not self._warmed:
+                threading.Thread(
+                    target=lambda: session.request("GET", URL_STATUS, headers=build_headers(self.token, device_id)),
+                    daemon=True
+                ).start()
+                self._warmed = True
             if diff > 1:       time.sleep(0.25)
             elif diff > 0.1:   time.sleep(0.01)
             elif diff > 0.01:  time.sleep(0.001)
@@ -292,32 +315,44 @@ class SlotWorker:
         self.log("ok", f"[Slot {slot}] Burst engine engaged!")
         success = False
 
-        for i in range(cfg["burst_count"]):
-            if self.stop.is_set():
-                break
-
-            jitter_ms   = random.uniform(-2, 2)
-            shot_target = target + timedelta(milliseconds=i * cfg["burst_interval_ms"] + jitter_ms)
-
-            while not self.stop.is_set():
-                diff = (shot_target - synced_time(start_bt, start_perf)).total_seconds()
-                if diff <= 0:
-                    break
-                time.sleep(min(max(diff * 0.6, 0.001), 0.05))
-
-            actual      = synced_time(start_bt, start_perf)
-            timing_err  = (actual - shot_target).total_seconds() * 1000
+        if cfg.get("single_shot", False):
+            actual = synced_time(start_bt, start_perf)
+            timing_err = (actual - target).total_seconds() * 1000
             self.log("info",
-                f"[Slot {slot}] Shot {i+1:02}/{cfg['burst_count']:02}  "
-                f"target={shot_target.strftime('%H:%M:%S.%f')[:-3]}  "
+                f"[Slot {slot}] Single-shot  "
+                f"target={target.strftime('%H:%M:%S.%f')[:-3]}  "
                 f"actual={actual.strftime('%H:%M:%S.%f')[:-3]}  "
                 f"err={timing_err:+.2f}ms")
-
-            resp = fire(session, self.token, device_id, self.log)
+            resp = retry_api(lambda: fire(session, self.token, device_id, self.log))
             if resp and handle_resp(resp, self.log):
                 success = True
-                self.log("ok", f"[Slot {slot}] Resolved on shot #{i+1}")
-                break
+        else:
+            for i in range(cfg["burst_count"]):
+                if self.stop.is_set():
+                    break
+
+                jitter_ms   = random.uniform(-2, 2)
+                shot_target = target + timedelta(milliseconds=i * cfg["burst_interval_ms"] + jitter_ms)
+
+                while not self.stop.is_set():
+                    diff = (shot_target - synced_time(start_bt, start_perf)).total_seconds()
+                    if diff <= 0:
+                        break
+                    time.sleep(min(max(diff * 0.6, 0.001), 0.05))
+
+                actual      = synced_time(start_bt, start_perf)
+                timing_err  = (actual - shot_target).total_seconds() * 1000
+                self.log("info",
+                    f"[Slot {slot}] Shot {i+1:02}/{cfg['burst_count']:02}  "
+                    f"target={shot_target.strftime('%H:%M:%S.%f')[:-3]}  "
+                    f"actual={actual.strftime('%H:%M:%S.%f')[:-3]}  "
+                    f"err={timing_err:+.2f}ms")
+
+                resp = retry_api(lambda: fire(session, self.token, device_id, self.log))
+                if resp and handle_resp(resp, self.log):
+                    success = True
+                    self.log("ok", f"[Slot {slot}] Resolved on shot #{i+1}")
+                    break
 
         if success:
             self.set_status("APPROVED")
@@ -438,8 +473,11 @@ class App(tk.Tk):
             "fire_min":          self._fire_min_var.get(),
             "fire_sec":          self._fire_sec_var.get(),
             "offset_ms":         self._offset_ms_var.get(),
+            "delay_ms":          self._delay_ms_var.get(),
             "burst_interval_ms": self._burst_interval_var.get(),
             "burst_count":       self._burst_count_var.get(),
+            "warmup_enabled":    self._warmup_var.get(),
+            "single_shot":       self._single_shot_var.get(),
         }
 
         enabled_slots = [i + 1 for i, v in enumerate(self._slot_enabled) if v.get()]
@@ -681,6 +719,27 @@ class App(tk.Tk):
                   lambda p: self._spinbox(p, self._burst_interval_var, 1, 1000))
         self._row(sec4, "Burst count",
                   lambda p: self._spinbox(p, self._burst_count_var, 1, 50))
+
+        sec5 = self._section(inner, "ADVANCED TIMING")
+        self._delay_ms_var = tk.IntVar(value=500)
+        self._row(sec5, "Delay before midnight (ms)",
+                  lambda p: self._spinbox(p, self._delay_ms_var, 0, 10000))
+        self._warmup_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sec5, text="Warm up session before firing",
+                       variable=self._warmup_var,
+                       bg=C["panel"], fg=C["text"],
+                       selectcolor=C["accent_dim"],
+                       activebackground=C["panel"],
+                       activeforeground=C["accent"],
+                       font=(FONT_UI, 9)).pack(anchor="w", pady=2)
+        self._single_shot_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(sec5, text="Single-shot mode (no burst)",
+                       variable=self._single_shot_var,
+                       bg=C["panel"], fg=C["text"],
+                       selectcolor=C["accent_dim"],
+                       activebackground=C["panel"],
+                       activeforeground=C["accent"],
+                       font=(FONT_UI, 9)).pack(anchor="w", pady=2)
 
         btn_sec = tk.Frame(inner, bg=C["bg"])
         btn_sec.pack(fill="x", padx=10, pady=12)
