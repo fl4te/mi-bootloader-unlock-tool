@@ -10,7 +10,6 @@ import time
 import json
 import hashlib
 import random
-import signal
 import ctypes
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -29,8 +28,20 @@ import ntplib
 import pytz
 import urllib3
 
+_TIMER_PERIOD_SET = False
 if os.name == "nt":
-    ctypes.windll.winmm.timeBeginPeriod(1)
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        _TIMER_PERIOD_SET = True
+    except Exception:
+        pass
+
+def _cleanup_timer():
+    if os.name == "nt" and _TIMER_PERIOD_SET:
+        try:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except Exception:
+            pass
 
 TZ_BEIJING  = pytz.timezone("Asia/Shanghai")
 URL_STATUS  = "https://sgp-api.buy.mi.com/bbs/api/global/user/bl-switch/state"
@@ -68,7 +79,6 @@ SLOT_TOKEN_MAP = {1: 1, 2: 2, 3: 1, 4: 2}
 
 BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
-
 def now_beijing():
     return datetime.now(timezone.utc).astimezone(TZ_BEIJING)
 
@@ -103,32 +113,70 @@ def get_ntp_beijing(log_cb):
     return bt
 
 def build_headers(token, device_id):
-    return {"Cookie": (
-        f"new_bbs_serviceToken={token}; "
-        f"versionCode=500411; versionName=5.4.11; deviceId={device_id};"
-    )}
+    return {
+        "User-Agent":   UA,
+        "Content-Type": "application/json",
+        "Connection":   "keep-alive",
+        "Cookie": (
+            f"new_bbs_serviceToken={token}; "
+            f"versionCode=500411; versionName=5.4.11; deviceId={device_id};"
+        ),
+    }
 
 def make_session():
     return urllib3.PoolManager(
         maxsize=10,
-        retries=urllib3.Retry(total=1, backoff_factor=0),
+        retries=urllib3.Retry(
+            total=2,
+            connect=2,
+            read=1,
+            redirect=0,
+            backoff_factor=0.1,
+        ),
         timeout=urllib3.Timeout(connect=2.0, read=5.0),
     )
 
+def _release(r):
+    try:
+        r.close()
+    except Exception:
+        pass
+    try:
+        r.release_conn()
+    except Exception:
+        pass
+
+def measure_latency(session, token, device_id, log_cb):
+    try:
+        start = time.perf_counter()
+        r = session.request("GET", URL_STATUS, headers=build_headers(token, device_id))
+        try:
+            r.data.decode("utf-8")
+        finally:
+            _release(r)
+        latency_ms = (time.perf_counter() - start) * 1000
+        log_cb("ok", f"Measured latency to server: {latency_ms:.1f} ms")
+        return latency_ms
+    except Exception as e:
+        log_cb("error", f"Latency test failed: {e}")
+        return None
+
 def check_status(session, token, device_id, log_cb):
     try:
-        r   = session.request("GET", URL_STATUS, headers=build_headers(token, device_id))
-        raw = r.data.decode("utf-8")
-        try: r.close()
-        except: r.release_conn()
-        data     = json.loads(raw)
-        code     = data.get("code")
+        r = session.request("GET", URL_STATUS, headers=build_headers(token, device_id))
+        try:
+            raw = r.data.decode("utf-8")
+        finally:
+            _release(r)
+
+        data    = json.loads(raw)
+        code    = data.get("code")
         if code == 100004:
             log_cb("error", "Token expired or invalid — please refresh it.")
             return False
-        info     = data.get("data", {})
-        is_pass  = info.get("is_pass")
-        btn      = info.get("button_state")
+        info    = data.get("data", {})
+        is_pass = info.get("is_pass")
+        btn     = info.get("button_state")
         log_cb("debug", f"Status → is_pass={is_pass} button={btn}")
         if is_pass == 4 and btn == 1:
             log_cb("ok",   "Account READY — burst window available ✓")
@@ -147,12 +195,13 @@ def fire(session, token, device_id, log_cb):
     try:
         t0  = time.perf_counter()
         r   = session.request("POST", URL_APPLY,
-                              headers=build_headers(token, device_id),
-                              body=b'{"is_retry":true}')
+                             headers=build_headers(token, device_id),
+                             body=b'{"is_retry":true}')
         lat = (time.perf_counter() - t0) * 1000
-        raw = r.data.decode("utf-8")
-        try: r.close()
-        except: r.release_conn()
+        try:
+            raw = r.data.decode("utf-8")
+        finally:
+            _release(r)
         log_cb("debug", f"POST {lat:.1f} ms  →  {raw[:120]}")
         return json.loads(raw)
     except Exception as e:
@@ -177,7 +226,6 @@ def handle_resp(resp, log_cb):
     else:
         log_cb("warn", f"Unknown result state: {resp}")
     return False
-
 
 class SlotWorker:
     def __init__(self, slot_num: int, token: str, cfg: dict, log_cb, status_cb, stop_event):
@@ -212,11 +260,13 @@ class SlotWorker:
             target = start_bt.replace(
                 hour=cfg["fire_hour"], minute=cfg["fire_min"],
                 second=cfg["fire_sec"], microsecond=0)
-            self.log("warn", f"[Slot {slot}] Manual target: {target.strftime('%H:%M:%S Beijing')}")
+            if target <= start_bt:
+                target += timedelta(days=1)
+            self.log("warn", f"[Slot {slot}] Manual target: {target.strftime('%d.%m.%Y %H:%M:%S Beijing')}")
         else:
             target = (start_bt + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0)
-            self.log("warn", f"[Slot {slot}] Auto target: {target.strftime('%Y-%m-%d %H:%M:%S Beijing')}")
+            self.log("warn", f"[Slot {slot}] Auto target: {target.strftime('%d.%m.%Y %H:%M:%S Beijing')}")
 
         fire_start = target - timedelta(milliseconds=cfg["offset_ms"])
 
@@ -239,18 +289,21 @@ class SlotWorker:
             return
 
         self.set_status("FIRING")
-        self.log("ok",  f"[Slot {slot}] Burst engine engaged!")
+        self.log("ok", f"[Slot {slot}] Burst engine engaged!")
         success = False
 
         for i in range(cfg["burst_count"]):
             if self.stop.is_set():
                 break
-            shot_target = target + timedelta(milliseconds=i * cfg["burst_interval_ms"])
+
+            jitter_ms   = random.uniform(-2, 2)
+            shot_target = target + timedelta(milliseconds=i * cfg["burst_interval_ms"] + jitter_ms)
+
             while not self.stop.is_set():
                 diff = (shot_target - synced_time(start_bt, start_perf)).total_seconds()
                 if diff <= 0:
                     break
-                time.sleep(max(diff * 0.7, 0.0001))
+                time.sleep(min(max(diff * 0.6, 0.001), 0.05))
 
             actual      = synced_time(start_bt, start_perf)
             timing_err  = (actual - shot_target).total_seconds() * 1000
@@ -272,7 +325,6 @@ class SlotWorker:
             self.set_status("Exhausted")
             self.log("warn", f"[Slot {slot}] Burst complete — no approval. Retry tomorrow 00:00 Beijing.")
 
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -283,13 +335,13 @@ class App(tk.Tk):
 
         self._stop_event = threading.Event()
         self._workers    = []
+        self._latency_session = make_session()
 
         self._build_ui()
         self._load_files()
         self._tick_clock()
-        
-        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
     def _load_files(self):
         tf = BASE_DIR / "token.txt"
@@ -298,30 +350,24 @@ class App(tk.Tk):
             if len(lines) >= 1: self._token1_var.set(lines[0].strip())
             if len(lines) >= 2: self._token2_var.set(lines[1].strip())
 
-        tsf = BASE_DIR / "timeshift.txt"
-        if tsf.exists():
-            self._log("info", f"timeshift.txt found at {tsf} (not used by GUI directly)")
-
     def _save_tokens(self):
         tf = BASE_DIR / "token.txt"
         tf.write_text(f"{self._token1_var.get().strip()}\n{self._token2_var.get().strip()}\n")
+        if os.name != "nt":
+            try:
+                os.chmod(tf, 0o600)
+            except Exception:
+                pass
         self._log("ok", "token.txt saved ✓")
-
 
     def _tick_clock(self):
         bt = now_beijing()
         self._clock_var.set(bt.strftime("%H:%M:%S") + "  Beijing")
         self.after(500, self._tick_clock)
 
-
     def _log(self, level: str, msg: str):
-        tag_map = {
-            "ok":    "ok",
-            "info":  "info",
-            "warn":  "warn",
-            "error": "error",
-            "debug": "debug",
-        }
+        tag_map = {"ok": "ok", "info": "info", "warn": "warn",
+                   "error": "error", "debug": "debug"}
         ts  = now_beijing().strftime("%H:%M:%S.%f")[:-3]
         tag = tag_map.get(level, "info")
         prefix = {"ok":"OK  ", "info":"INFO", "warn":"WARN", "error":"ERR ",
@@ -331,7 +377,6 @@ class App(tk.Tk):
         self._log_box.insert("end", f"[{ts}]  {prefix}  {msg}\n", tag)
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
-
 
     def _make_status_cb(self, slot_idx: int):
         def _cb(status: str):
@@ -343,6 +388,21 @@ class App(tk.Tk):
             self.after(0, lambda: self._log(level, msg))
         return _cb
 
+    def _on_test_latency(self):
+        t1 = self._token1_var.get().strip()
+        if not t1:
+            messagebox.showerror("Missing token", "Please fill in Token 1 to test latency.")
+            return
+        device_id = gen_device_id()
+        latency = measure_latency(self._latency_session, t1, device_id, self._log)
+        if latency:
+            tuned_offset = int(latency * 2.0)
+            tuned_interval = max(10, int(latency * 1.2))
+            self._offset_ms_var.set(tuned_offset)
+            self._burst_interval_var.set(tuned_interval)
+            self._log("ok",
+                f"[Auto-Tune] latency={latency:.1f}ms → "
+                f"offset={tuned_offset}ms interval={tuned_interval}ms")
 
     def _on_run(self):
         t1 = self._token1_var.get().strip()
@@ -352,6 +412,19 @@ class App(tk.Tk):
                 "Please fill in both Token 1 and Token 2 before running.")
             return
 
+        tokens = {1: t1, 2: t2}
+
+        device_id = gen_device_id()
+        latency = measure_latency(self._latency_session, t1, device_id, self._log)
+        if latency:
+            tuned_offset = int(latency * 2.0)
+            tuned_interval = max(10, int(latency * 1.2))
+            self._offset_ms_var.set(tuned_offset)
+            self._burst_interval_var.set(tuned_interval)
+            self._log("ok",
+                f"[Auto-Tune] latency={latency:.1f}ms → "
+                f"offset={tuned_offset}ms interval={tuned_interval}ms")
+
         self._stop_event.clear()
         self._workers.clear()
         self._run_btn.configure(state="disabled")
@@ -359,7 +432,6 @@ class App(tk.Tk):
                                  bg=COLORS["error"], fg="white",
                                  activebackground="#be123c")
 
-        tokens = {1: t1, 2: t2}
         cfg = {
             "skip_timing":       self._skip_timing_var.get(),
             "fire_hour":         self._fire_hour_var.get(),
@@ -370,7 +442,7 @@ class App(tk.Tk):
             "burst_count":       self._burst_count_var.get(),
         }
 
-        enabled_slots = [i+1 for i, v in enumerate(self._slot_enabled) if v.get()]
+        enabled_slots = [i + 1 for i, v in enumerate(self._slot_enabled) if v.get()]
         if not enabled_slots:
             messagebox.showwarning("No slots", "Enable at least one slot.")
             self._run_btn.configure(state="normal")
@@ -390,6 +462,11 @@ class App(tk.Tk):
     def _on_stop(self):
         self._stop_event.set()
         self._log("warn", "Stop requested — workers will halt at next checkpoint.")
+
+        for w in self._workers:
+            if w.thread.is_alive():
+                w.thread.join(timeout=1)
+
         self._run_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled",
                                  bg=COLORS["border"], fg=COLORS["text_dim"],
@@ -398,13 +475,13 @@ class App(tk.Tk):
 
     def _on_window_close(self):
         self._on_stop()
+        _cleanup_timer()
         self.destroy()
 
     def _on_clear_log(self):
         self._log_box.configure(state="normal")
         self._log_box.delete("1.0", "end")
         self._log_box.configure(state="disabled")
-
 
     def _build_ui(self):
         C = COLORS
@@ -445,22 +522,17 @@ class App(tk.Tk):
         body.pack(fill="both", expand=True)
 
         paned = tk.PanedWindow(body, orient="horizontal",
-                               bg=C["border"],
-                               sashwidth=5,
-                               sashrelief="flat",
-                               opaqueresize=True,
-                               handlesize=0)
+                               bg=C["border"], sashwidth=5,
+                               sashrelief="flat", opaqueresize=True, handlesize=0)
         paned.pack(fill="both", expand=True)
 
-        left = tk.Frame(paned, bg=C["bg"])
+        left  = tk.Frame(paned, bg=C["bg"])
         right = tk.Frame(paned, bg=C["bg"])
-
         paned.add(left,  minsize=260, width=320, stretch="never")
         paned.add(right, minsize=400, stretch="always")
 
         self._build_config(left)
         self._build_slots_and_log(right)
-
 
     def _section(self, parent, title):
         outer = tk.Frame(parent, bg=COLORS["panel"],
@@ -525,34 +597,36 @@ class App(tk.Tk):
         canvas.bind("<Configure>", _on_canvas_configure)
 
         def _on_mousewheel(e):
-            canvas.yview_scroll(int(-1*(e.delta/120)), "units")
-            
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
         canvas.bind("<MouseWheel>", _on_mousewheel)
         inner.bind("<MouseWheel>", _on_mousewheel)
 
         sec = self._section(inner, "TOKENS")
         self._token1_var = tk.StringVar()
         self._token2_var = tk.StringVar()
-        
-        self._token1_entry = self._row(sec, "Token 1", lambda p: self._entry(p, self._token1_var, show="*"))
-        self._token2_entry = self._row(sec, "Token 2", lambda p: self._entry(p, self._token2_var, show="*"))
+        self._token1_entry = self._row(sec, "Token 1",
+            lambda p: self._entry(p, self._token1_var, show="*"))
+        self._token2_entry = self._row(sec, "Token 2",
+            lambda p: self._entry(p, self._token2_var, show="*"))
 
         btn_row = tk.Frame(sec, bg=C["panel"])
         btn_row.pack(fill="x", pady=(4, 0))
         tk.Button(btn_row, text="👁  Show/Hide",
                   bg=C["border_light"], fg=C["text_dim"],
-                  activebackground=C["accent2_dim"],
-                  activeforeground=C["text"],
-                  relief="flat", font=(FONT_UI, 8),
-                  cursor="hand2", padx=6, pady=3,
+                  activebackground=C["accent2_dim"], activeforeground=C["text"],
+                  relief="flat", font=(FONT_UI, 8), cursor="hand2", padx=6, pady=3,
                   command=self._toggle_token_vis).pack(side="left", padx=(0, 6))
         tk.Button(btn_row, text="💾  Save",
                   bg=C["accent2_dim"], fg=C["text"],
-                  activebackground=C["accent2"],
-                  activeforeground="white",
-                  relief="flat", font=(FONT_UI, 8, "bold"),
-                  cursor="hand2", padx=6, pady=3,
-                  command=self._save_tokens).pack(side="left")
+                  activebackground=C["accent2"], activeforeground="white",
+                  relief="flat", font=(FONT_UI, 8, "bold"), cursor="hand2", padx=6, pady=3,
+                  command=self._save_tokens).pack(side="left", padx=(0, 6))
+        tk.Button(btn_row, text="📡 Test Latency",
+                  bg=C["accent2_dim"], fg=C["text"],
+                  activebackground=C["accent2"], activeforeground="white",
+                  relief="flat", font=(FONT_UI, 8, "bold"), cursor="hand2", padx=6, pady=3,
+                  command=self._on_test_latency).pack(side="left")
 
         sec2 = self._section(inner, "ENABLED SLOTS")
         self._slot_enabled = [tk.BooleanVar(value=True) for _ in range(4)]
@@ -592,7 +666,7 @@ class App(tk.Tk):
                                 ("MM", self._fire_min_var,  59),
                                 ("SS", self._fire_sec_var,  59)]:
             tk.Label(hf, text=label, bg=C["panel"], fg=C["text_dim"],
-                     font=(FONT_UI, 8, "bold")).pack(side="left", padx=(6,2))
+                     font=(FONT_UI, 8, "bold")).pack(side="left", padx=(6, 2))
             self._spinbox(hf, var, 0, hi, width=4).pack(side="left", padx=2)
         self._toggle_manual_time()
 
@@ -615,8 +689,7 @@ class App(tk.Tk):
                                   bg=C["accent"], fg="white",
                                   activebackground="#ea6810",
                                   font=(FONT_UI, 11, "bold"),
-                                  relief="flat", cursor="hand2",
-                                  pady=8,
+                                  relief="flat", cursor="hand2", pady=8,
                                   command=self._on_run)
         self._run_btn.pack(fill="x", pady=(0, 6))
 
@@ -625,8 +698,7 @@ class App(tk.Tk):
                                    activebackground=C["error"],
                                    activeforeground="white",
                                    font=(FONT_UI, 11, "bold"),
-                                   relief="flat", cursor="hand2",
-                                   pady=8,
+                                   relief="flat", cursor="hand2", pady=8,
                                    state="disabled",
                                    command=self._on_stop)
         self._stop_btn.pack(fill="x")
@@ -640,12 +712,11 @@ class App(tk.Tk):
     def _toggle_manual_time(self):
         state = "normal" if self._skip_timing_var.get() else "disabled"
         for child in self._manual_frame.winfo_children():
-            for subchild in child.winfo_children() if hasattr(child, "winfo_children") else []:
+            for subchild in (child.winfo_children() if hasattr(child, "winfo_children") else []):
                 try: subchild.configure(state=state)
                 except: pass
             try: child.configure(state=state)
             except: pass
-
 
     def _build_slots_and_log(self, parent):
         C = COLORS
@@ -674,15 +745,13 @@ class App(tk.Tk):
                      bg=C["panel"], fg=C["text"],
                      font=(FONT_UI, 10, "bold")).pack(side="left", anchor="w")
 
-            tk.Label(pane,
-                     text=f"Token #{SLOT_TOKEN_MAP[i+1]}",
+            tk.Label(pane, text=f"Token #{SLOT_TOKEN_MAP[i+1]}",
                      bg=C["panel"], fg=C["muted"],
                      font=(FONT_UI, 8)).pack(anchor="w", padx=8)
 
-            status_lbl = tk.Label(pane, textvariable=self._slot_status[i],
+            tk.Label(pane, textvariable=self._slot_status[i],
                      bg=C["panel"], fg=C["accent2"],
-                     font=(FONT_MONO, 9, "bold"))
-            status_lbl.pack(anchor="w", padx=8, pady=(2, 8))
+                     font=(FONT_MONO, 9, "bold")).pack(anchor="w", padx=8, pady=(2, 8))
 
         log_header = tk.Frame(parent, bg=C["bg"])
         log_header.pack(fill="x", padx=10, pady=(6, 2))
@@ -691,22 +760,18 @@ class App(tk.Tk):
                  font=(FONT_UI, 9, "bold")).pack(side="left")
         tk.Button(log_header, text="✕ Clear",
                   bg=C["border"], fg=C["text_dim"],
-                  activebackground=C["border_light"],
-                  activeforeground=C["text"],
-                  relief="flat", font=(FONT_UI, 8),
-                  cursor="hand2", padx=6, pady=2,
+                  activebackground=C["border_light"], activeforeground=C["text"],
+                  relief="flat", font=(FONT_UI, 8), cursor="hand2", padx=6, pady=2,
                   command=self._on_clear_log).pack(side="right")
 
         self._log_box = scrolledtext.ScrolledText(
             parent, state="disabled", wrap="word",
             bg=C["input_bg"], fg=C["text"],
-            font=(FONT_MONO, 8),
-            relief="flat",
+            font=(FONT_MONO, 8), relief="flat",
             insertbackground=C["accent"],
             selectbackground=C["accent2_dim"],
             selectforeground=C["text"],
-            height=22,
-            padx=8, pady=6,
+            height=22, padx=8, pady=6,
         )
         self._log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -720,7 +785,6 @@ class App(tk.Tk):
         self._log_box.tag_configure("error", font=(FONT_MONO, 8, "bold"))
 
         self._log("info", "GUI loaded. Fill tokens, configure, then press RUN.")
-
 
 def main():
     app = App()
