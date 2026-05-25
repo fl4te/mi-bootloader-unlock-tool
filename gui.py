@@ -120,7 +120,7 @@ def get_ntp_beijing(log_cb):
             r  = client.request(srv, version=3, timeout=3)
             lat = (time.perf_counter() - t0) * 1000
             bt  = datetime.fromtimestamp(r.tx_time, timezone.utc).astimezone(TZ_BEIJING)
-            log_cb("ok",    f"NTP sync OK  ← {srv}  ({lat:.1f} ms)")
+            log_cb("ok",    f"NTP sync OK  <- {srv}  ({lat:.1f} ms)")
             log_cb("debug", f"offset={r.offset*1000:.2f} ms | delay={r.delay*1000:.2f} ms")
             return bt
         except Exception as e:
@@ -203,7 +203,7 @@ def check_status(session, token, device_id, log_cb):
         info    = data.get("data", {})
         is_pass = info.get("is_pass")
         btn     = info.get("button_state")
-        log_cb("debug", f"Status → is_pass={is_pass} button={btn}")
+        log_cb("debug", f"Status -> is_pass={is_pass} button={btn}")
         if is_pass == 4 and btn == 1:
             log_cb("ok",   "Account READY — burst window available ✓")
             return True
@@ -228,7 +228,7 @@ def fire(session, token, device_id, log_cb):
             raw = r.data.decode("utf-8")
         finally:
             _release(r)
-        log_cb("debug", f"POST {lat:.1f} ms  →  {raw[:120]}")
+        log_cb("debug", f"POST {lat:.1f} ms  ->  {raw[:120]}")
         return json.loads(raw)
     except Exception as e:
         log_cb("error", f"Fire exception: {e}")
@@ -305,7 +305,7 @@ class SlotWorker:
         fire_start = target
 
         self.set_status("waiting")
-        self.log("info", f"[Slot {slot}] Waiting for fire window…")
+        self.log("info", f"[Slot {slot}] Waiting for fire window...")
 
         while not self.stop.is_set():
             now  = synced_time(start_bt, start_perf)
@@ -450,13 +450,18 @@ class App(tk.Tk):
             if latency:
                 tuned_offset   = int(latency * 2.0)
                 tuned_interval = max(10, int(latency * 1.2))
-                def _apply():
-                    self._offset_ms_var.set(tuned_offset)
-                    self._burst_interval_var.set(tuned_interval)
-                self.after(0, _apply)
-                log_cb("ok",
-                    f"[Auto-Tune] latency={latency:.1f}ms → "
-                    f"offset={tuned_offset}ms interval={tuned_interval}ms")
+                if self._autotune_var.get():
+                    def _apply():
+                        self._offset_ms_var.set(tuned_offset)
+                        self._burst_interval_var.set(tuned_interval)
+                    self.after(0, _apply)
+                    log_cb("ok",
+                        f"[Auto-Tune] latency={latency:.1f}ms -> "
+                        f"offset={tuned_offset}ms interval={tuned_interval}ms (applied)")
+                else:
+                    log_cb("info",
+                        f"[Auto-Tune] latency={latency:.1f}ms -> "
+                        f"offset={tuned_offset}ms interval={tuned_interval}ms (not applied — auto-tune off)")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -502,15 +507,20 @@ class App(tk.Tk):
             if latency:
                 tuned_offset   = int(latency * 2.0)
                 tuned_interval = max(10, int(latency * 1.2))
-                cfg["offset_ms"]         = tuned_offset
-                cfg["burst_interval_ms"] = tuned_interval
-                def _apply():
-                    self._offset_ms_var.set(tuned_offset)
-                    self._burst_interval_var.set(tuned_interval)
-                self.after(0, _apply)
-                log_cb("ok",
-                    f"[Auto-Tune] latency={latency:.1f}ms → "
-                    f"offset={tuned_offset}ms interval={tuned_interval}ms")
+                if self._autotune_var.get():
+                    cfg["offset_ms"]         = tuned_offset
+                    cfg["burst_interval_ms"] = tuned_interval
+                    def _apply():
+                        self._offset_ms_var.set(tuned_offset)
+                        self._burst_interval_var.set(tuned_interval)
+                    self.after(0, _apply)
+                    log_cb("ok",
+                        f"[Auto-Tune] latency={latency:.1f}ms -> "
+                        f"offset={tuned_offset}ms interval={tuned_interval}ms (applied)")
+                else:
+                    log_cb("info",
+                        f"[Auto-Tune] latency={latency:.1f}ms -> "
+                        f"offset={tuned_offset}ms interval={tuned_interval}ms (skipped — using manual values)")
 
             log_cb("info", f"Starting slots: {enabled_slots}")
             for slot in enabled_slots:
@@ -781,6 +791,14 @@ class App(tk.Tk):
         self._single_shot_var = tk.BooleanVar(value=False)
         tk.Checkbutton(sec5, text="Single-shot mode (no burst)",
                        variable=self._single_shot_var,
+                       bg=C["panel"], fg=C["text"],
+                       selectcolor=C["accent_dim"],
+                       activebackground=C["panel"],
+                       activeforeground=C["accent"],
+                       font=(FONT_UI, 9)).pack(anchor="w", pady=2)
+        self._autotune_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sec5, text="Auto-tune timing on run",
+                       variable=self._autotune_var,
                        bg=C["panel"], fg=C["text"],
                        selectcolor=C["accent_dim"],
                        activebackground=C["panel"],
