@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox
 import threading
-import subprocess
 import sys
 import os
 import time
@@ -11,18 +10,23 @@ import json
 import hashlib
 import random
 import ctypes
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Callable, Optional
 
-def _install(pkg):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-for _p in ("ntplib", "pytz", "urllib3", "colorama"):
+REQUIRED = ["ntplib", "pytz", "urllib3"]
+_missing = []
+for _pkg in REQUIRED:
     try:
-        __import__(_p)
+        __import__(_pkg)
     except ImportError:
-        _install(_p)
+        _missing.append(_pkg)
+
+if _missing:
+    print("Missing required dependencies. Install them with:")
+    print(f"  pip install {' '.join(_missing)}")
+    sys.exit(1)
 
 import atexit
 import ntplib
@@ -52,6 +56,20 @@ URL_APPLY   = "https://sgp-api.buy.mi.com/bbs/api/global/apply/bl-auth"
 UA          = "okhttp/4.12.0"
 NTP_SERVERS = ["ntp0.ntp-servers.net", "ntp1.ntp-servers.net", "ntp2.ntp-servers.net"]
 
+JITTER_MS = 2.0
+
+SLOT_TOKEN_MAP = {1: 1, 2: 2, 3: 1, 4: 2}
+
+LOG_PREFIX = {
+    "ok":    "OK  ",
+    "info":  "INFO",
+    "warn":  "WARN",
+    "error": "ERR ",
+    "debug": "DBG ",
+}
+
+BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+
 COLORS = {
     "bg":           "#0b0d13",
     "panel":        "#12151f",
@@ -75,7 +93,7 @@ COLORS = {
     "header_bg":    "#0e1018",
 }
 
-FONT_MONO  = "Courier New"
+FONT_MONO = "Courier New"
 if os.name == "nt":
     FONT_UI = "Segoe UI"
 elif sys.platform == "darwin":
@@ -83,53 +101,59 @@ elif sys.platform == "darwin":
 else:
     FONT_UI = "DejaVu Sans"
 
-SLOT_TOKEN_MAP = {1: 1, 2: 2, 3: 1, 4: 2}
+@dataclass
+class Config:
+    skip_timing:       bool
+    fire_hour:         int
+    fire_min:          int
+    fire_sec:          int
+    offset_ms:         int
+    delay_ms:          int
+    burst_interval_ms: int
+    burst_count:       int
+    warmup_enabled:    bool
+    single_shot:       bool
 
-LOG_PREFIX = {
-    "ok":    "OK  ",
-    "info":  "INFO",
-    "warn":  "WARN",
-    "error": "ERR ",
-    "debug": "DBG ",
-}
-
-BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-
-def now_beijing():
+def now_beijing() -> datetime:
     return datetime.now(timezone.utc).astimezone(TZ_BEIJING)
 
-def gen_device_id():
+def gen_device_id() -> str:
     import secrets
     return hashlib.sha1(f"{secrets.token_hex(16)}-{time.time()}".encode()).hexdigest().upper()
 
-def synced_time(start_bt, start_perf):
+def synced_time(start_bt: datetime, start_perf: float) -> datetime:
     return start_bt + timedelta(seconds=time.perf_counter() - start_perf)
 
-def format_remaining(seconds):
-    seconds = max(0, seconds)
+def format_remaining(seconds: float) -> str:
+    seconds = max(0.0, seconds)
     h, rem = divmod(int(seconds), 3600)
     m, s   = divmod(rem, 60)
     ms     = int((seconds % 1) * 1000)
     return f"{h:02}:{m:02}:{s:02}.{ms:03}"
 
-def get_ntp_beijing(log_cb):
+def calculate_autotune(latency_ms: float) -> tuple[int, int]:
+    offset_ms   = int(latency_ms * 2.0)
+    interval_ms = max(10, int(latency_ms * 1.2))
+    return offset_ms, interval_ms
+
+def get_ntp_beijing(log_cb: Callable) -> datetime:
     client = ntplib.NTPClient()
     for srv in NTP_SERVERS:
         try:
-            t0 = time.perf_counter()
-            r  = client.request(srv, version=3, timeout=3)
+            t0  = time.perf_counter()
+            r   = client.request(srv, version=3, timeout=3)
             lat = (time.perf_counter() - t0) * 1000
             bt  = datetime.fromtimestamp(r.tx_time, timezone.utc).astimezone(TZ_BEIJING)
             log_cb("ok",    f"NTP sync OK  <- {srv}  ({lat:.1f} ms)")
             log_cb("debug", f"offset={r.offset*1000:.2f} ms | delay={r.delay*1000:.2f} ms")
             return bt
-        except Exception as e:
+        except OSError as e:
             log_cb("warn", f"NTP failed: {srv} ({e})")
     bt = now_beijing()
     log_cb("warn", "Falling back to local system clock")
     return bt
 
-def build_headers(token, device_id):
+def build_headers(token: str, device_id: str) -> dict:
     return {
         "User-Agent":   UA,
         "Content-Type": "application/json",
@@ -140,7 +164,7 @@ def build_headers(token, device_id):
         ),
     }
 
-def make_session():
+def make_session() -> urllib3.PoolManager:
     return urllib3.PoolManager(
         maxsize=10,
         retries=urllib3.Retry(
@@ -153,7 +177,7 @@ def make_session():
         timeout=urllib3.Timeout(connect=2.0, read=5.0),
     )
 
-def _release(r):
+def _release(r) -> None:
     try:
         r.close()
     except Exception:
@@ -163,16 +187,25 @@ def _release(r):
     except Exception:
         pass
 
-def retry_api(func, max_retries=3, delay=0.5):
+def retry_api(func: Callable, max_retries: int = 3, delay: float = 0.5):
     for i in range(max_retries):
         try:
             return func()
+        except urllib3.exceptions.HTTPError:
+            if i == max_retries - 1:
+                raise
+            time.sleep(delay)
         except Exception:
             if i == max_retries - 1:
                 raise
             time.sleep(delay)
 
-def measure_latency(session, token, device_id, log_cb):
+def measure_latency(
+    session: urllib3.PoolManager,
+    token: str,
+    device_id: str,
+    log_cb: Callable,
+) -> Optional[float]:
     try:
         start = time.perf_counter()
         r = session.request("GET", URL_STATUS, headers=build_headers(token, device_id))
@@ -183,11 +216,19 @@ def measure_latency(session, token, device_id, log_cb):
         latency_ms = (time.perf_counter() - start) * 1000
         log_cb("ok", f"Measured latency to server: {latency_ms:.1f} ms")
         return latency_ms
-    except Exception as e:
-        log_cb("error", f"Latency test failed: {e}")
+    except urllib3.exceptions.HTTPError as e:
+        log_cb("error", f"Latency test failed (HTTP): {e}")
+        return None
+    except OSError as e:
+        log_cb("error", f"Latency test failed (network): {e}")
         return None
 
-def check_status(session, token, device_id, log_cb):
+def check_status(
+    session: urllib3.PoolManager,
+    token: str,
+    device_id: str,
+    log_cb: Callable,
+) -> bool:
     try:
         r = session.request("GET", URL_STATUS, headers=build_headers(token, device_id))
         try:
@@ -195,15 +236,22 @@ def check_status(session, token, device_id, log_cb):
         finally:
             _release(r)
 
-        data    = json.loads(raw)
-        code    = data.get("code")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            log_cb("error", f"Status response not valid JSON: {e}")
+            return False
+
+        code = data.get("code")
         if code == 100004:
             log_cb("error", "Token expired or invalid — please refresh it.")
             return False
+
         info    = data.get("data", {})
         is_pass = info.get("is_pass")
         btn     = info.get("button_state")
         log_cb("debug", f"Status -> is_pass={is_pass} button={btn}")
+
         if is_pass == 4 and btn == 1:
             log_cb("ok",   "Account READY — burst window available ✓")
             return True
@@ -213,32 +261,51 @@ def check_status(session, token, device_id, log_cb):
         else:
             log_cb("error", f"Criteria not met (is_pass={is_pass}, btn={btn})")
             return False
-    except Exception as e:
-        log_cb("error", f"Status check exception: {e}")
+
+    except urllib3.exceptions.HTTPError as e:
+        log_cb("error", f"Status check HTTP error: {e}")
+        return False
+    except OSError as e:
+        log_cb("error", f"Status check network error: {e}")
         return False
 
-def fire(session, token, device_id, log_cb):
+def fire(
+    session: urllib3.PoolManager,
+    token: str,
+    device_id: str,
+    log_cb: Callable,
+) -> Optional[dict]:
     try:
         t0  = time.perf_counter()
-        r   = session.request("POST", URL_APPLY,
-                             headers=build_headers(token, device_id),
-                             body=b'{"is_retry":true}')
+        r   = session.request(
+            "POST", URL_APPLY,
+            headers=build_headers(token, device_id),
+            body=b'{"is_retry":true}',
+        )
         lat = (time.perf_counter() - t0) * 1000
         try:
             raw = r.data.decode("utf-8")
         finally:
             _release(r)
         log_cb("debug", f"POST {lat:.1f} ms  ->  {raw[:120]}")
-        return json.loads(raw)
-    except Exception as e:
-        log_cb("error", f"Fire exception: {e}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            log_cb("error", f"Fire response not valid JSON: {e}")
+            return None
+    except urllib3.exceptions.HTTPError as e:
+        log_cb("error", f"Fire HTTP error: {e}")
+        return None
+    except OSError as e:
+        log_cb("error", f"Fire network error: {e}")
         return None
 
-def handle_resp(resp, log_cb):
+def handle_resp(resp: dict, log_cb: Callable) -> bool:
     code = resp.get("code")
     if code != 0:
         log_cb("error", f"API rejected (code={code})")
         return False
+
     data     = resp.get("data", {})
     result   = data.get("apply_result")
     deadline = data.get("deadline_format", "")
@@ -260,7 +327,15 @@ def handle_resp(resp, log_cb):
     return False
 
 class SlotWorker:
-    def __init__(self, slot_num: int, token: str, cfg: dict, log_cb, status_cb, stop_event):
+    def __init__(
+        self,
+        slot_num:  int,
+        token:     str,
+        cfg:       Config,
+        log_cb:    Callable,
+        status_cb: Callable,
+        stop_event: threading.Event,
+    ):
         self.slot       = slot_num
         self.token      = token
         self.cfg        = cfg
@@ -270,14 +345,14 @@ class SlotWorker:
         self.thread     = threading.Thread(target=self._run, daemon=True)
         self._warmed    = False
 
-    def start(self):
+    def start(self) -> None:
         self.thread.start()
 
-    def _run(self):
-        cfg        = self.cfg
-        device_id  = gen_device_id()
-        session    = make_session()
-        slot       = self.slot
+    def _run(self) -> None:
+        cfg       = self.cfg
+        device_id = gen_device_id()
+        session   = make_session()
+        slot      = self.slot
 
         self.log("info", f"[Slot {slot}] Starting — token #{SLOT_TOKEN_MAP[slot]}")
         self.set_status("checking")
@@ -289,21 +364,21 @@ class SlotWorker:
         start_bt   = get_ntp_beijing(self.log)
         start_perf = time.perf_counter()
 
-        if cfg["skip_timing"]:
+        if cfg.skip_timing:
             target = start_bt.replace(
-                hour=cfg["fire_hour"], minute=cfg["fire_min"],
-                second=cfg["fire_sec"], microsecond=0)
+                hour=cfg.fire_hour, minute=cfg.fire_min,
+                second=cfg.fire_sec, microsecond=0,
+            )
             if target <= start_bt:
                 target += timedelta(days=1)
             self.log("warn", f"[Slot {slot}] Manual target: {target.strftime('%d.%m.%Y %H:%M:%S Beijing')}")
         else:
-            delay_ms = cfg.get("delay_ms", cfg["offset_ms"])
             target = (start_bt + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0) - timedelta(milliseconds=delay_ms)
+                hour=0, minute=0, second=0, microsecond=0,
+            ) - timedelta(milliseconds=cfg.delay_ms)
             self.log("warn", f"[Slot {slot}] Auto target: {target.strftime('%d.%m.%Y %H:%M:%S Beijing')}")
 
         fire_start = target
-
         self.set_status("waiting")
         self.log("info", f"[Slot {slot}] Waiting for fire window...")
 
@@ -313,16 +388,23 @@ class SlotWorker:
             self.set_status(f"T-{format_remaining(diff)}")
             if diff <= 0:
                 break
-            if cfg.get("warmup_enabled", True) and diff <= 10 and not self._warmed:
+            if cfg.warmup_enabled and diff <= 10 and not self._warmed:
                 threading.Thread(
-                    target=lambda: session.request("GET", URL_STATUS, headers=build_headers(self.token, device_id)),
-                    daemon=True
+                    target=lambda: session.request(
+                        "GET", URL_STATUS,
+                        headers=build_headers(self.token, device_id),
+                    ),
+                    daemon=True,
                 ).start()
                 self._warmed = True
-            if diff > 1:       time.sleep(0.25)
-            elif diff > 0.1:   time.sleep(0.01)
-            elif diff > 0.01:  time.sleep(0.001)
-            else:              time.sleep(0.0001)
+            if diff > 1:
+                time.sleep(0.25)
+            elif diff > 0.1:
+                time.sleep(0.01)
+            elif diff > 0.001:
+                time.sleep(0.001)
+            else:
+                time.sleep(0.0001)
 
         if self.stop.is_set():
             self.set_status("stopped")
@@ -332,8 +414,8 @@ class SlotWorker:
         self.log("ok", f"[Slot {slot}] Burst engine engaged!")
         success = False
 
-        if cfg.get("single_shot", False):
-            actual = synced_time(start_bt, start_perf)
+        if cfg.single_shot:
+            actual     = synced_time(start_bt, start_perf)
             timing_err = (actual - target).total_seconds() * 1000
             self.log("info",
                 f"[Slot {slot}] Single-shot  "
@@ -344,12 +426,14 @@ class SlotWorker:
             if resp and handle_resp(resp, self.log):
                 success = True
         else:
-            for i in range(cfg["burst_count"]):
+            for i in range(cfg.burst_count):
                 if self.stop.is_set():
                     break
 
-                jitter_ms   = random.uniform(-2, 2)
-                shot_target = target + timedelta(milliseconds=i * cfg["burst_interval_ms"] + jitter_ms)
+                jitter_ms   = random.uniform(-JITTER_MS, JITTER_MS)
+                shot_target = target + timedelta(
+                    milliseconds=i * cfg.burst_interval_ms + jitter_ms
+                )
 
                 while not self.stop.is_set():
                     diff = (shot_target - synced_time(start_bt, start_perf)).total_seconds()
@@ -357,10 +441,10 @@ class SlotWorker:
                         break
                     time.sleep(min(max(diff * 0.6, 0.001), 0.05))
 
-                actual      = synced_time(start_bt, start_perf)
-                timing_err  = (actual - shot_target).total_seconds() * 1000
+                actual     = synced_time(start_bt, start_perf)
+                timing_err = (actual - shot_target).total_seconds() * 1000
                 self.log("info",
-                    f"[Slot {slot}] Shot {i+1:02}/{cfg['burst_count']:02}  "
+                    f"[Slot {slot}] Shot {i+1:02}/{cfg.burst_count:02}  "
                     f"target={shot_target.strftime('%H:%M:%S.%f')[:-3]}  "
                     f"actual={actual.strftime('%H:%M:%S.%f')[:-3]}  "
                     f"err={timing_err:+.2f}ms")
@@ -377,6 +461,7 @@ class SlotWorker:
             self.set_status("Exhausted")
             self.log("warn", f"[Slot {slot}] Burst complete — no approval. Retry tomorrow 00:00 Beijing.")
 
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -385,8 +470,8 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.minsize(960, 660)
 
-        self._stop_event = threading.Event()
-        self._workers    = []
+        self._stop_event      = threading.Event()
+        self._workers:        list[SlotWorker] = []
         self._latency_session = make_session()
 
         self._build_ui()
@@ -395,77 +480,81 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
-    def _load_files(self):
+    def _load_files(self) -> None:
         tf = BASE_DIR / "token.txt"
         if tf.exists():
             lines = tf.read_text().splitlines()
-            if len(lines) >= 1: self._token1_var.set(lines[0].strip())
-            if len(lines) >= 2: self._token2_var.set(lines[1].strip())
+            if len(lines) >= 1:
+                self._token1_var.set(lines[0].strip())
+            if len(lines) >= 2:
+                self._token2_var.set(lines[1].strip())
 
-    def _save_tokens(self):
+    def _save_tokens(self) -> None:
         tf = BASE_DIR / "token.txt"
         tf.write_text(f"{self._token1_var.get().strip()}\n{self._token2_var.get().strip()}\n")
         if os.name != "nt":
             try:
                 os.chmod(tf, 0o600)
-            except Exception:
+            except OSError:
                 pass
         self._log("ok", "token.txt saved ✓")
 
-    def _tick_clock(self):
+    def _tick_clock(self) -> None:
         bt = now_beijing()
         self._clock_var.set(bt.strftime("%H:%M:%S") + "  Beijing")
         self.after(500, self._tick_clock)
 
-    def _log(self, level: str, msg: str):
+    def _log(self, level: str, msg: str) -> None:
         ts     = now_beijing().strftime("%H:%M:%S.%f")[:-3]
         tag    = level if level in LOG_PREFIX else "info"
         prefix = LOG_PREFIX.get(level, "    ")
-
         self._log_box.configure(state="normal")
         self._log_box.insert("end", f"[{ts}]  {prefix}  {msg}\n", tag)
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
 
-    def _make_status_cb(self, slot_idx: int):
-        def _cb(status: str):
+    def _make_status_cb(self, slot_idx: int) -> Callable:
+        def _cb(status: str) -> None:
             self.after(0, lambda: self._slot_status[slot_idx].set(status))
         return _cb
 
-    def _make_log_cb(self):
-        def _cb(level, msg):
+    def _make_log_cb(self) -> Callable:
+        def _cb(level: str, msg: str) -> None:
             self.after(0, lambda: self._log(level, msg))
         return _cb
 
-    def _on_test_latency(self):
+    def _apply_autotune(self, latency_ms: float, log_cb: Callable, apply: bool) -> None:
+        offset_ms, interval_ms = calculate_autotune(latency_ms)
+        if apply:
+            def _set():
+                self._offset_ms_var.set(offset_ms)
+                self._burst_interval_var.set(interval_ms)
+            self.after(0, _set)
+            log_cb("ok",
+                f"[Auto-Tune] latency={latency_ms:.1f}ms -> "
+                f"offset={offset_ms}ms interval={interval_ms}ms (applied)")
+        else:
+            log_cb("info",
+                f"[Auto-Tune] latency={latency_ms:.1f}ms -> "
+                f"offset={offset_ms}ms interval={interval_ms}ms (not applied — auto-tune off)")
+        return offset_ms, interval_ms
+
+    def _on_test_latency(self) -> None:
         t1 = self._token1_var.get().strip()
         if not t1:
             messagebox.showerror("Missing token", "Please fill in Token 1 to test latency.")
             return
         log_cb = self._make_log_cb()
 
-        def _run():
+        def _run() -> None:
             device_id = gen_device_id()
-            latency = measure_latency(self._latency_session, t1, device_id, log_cb)
+            latency   = measure_latency(self._latency_session, t1, device_id, log_cb)
             if latency:
-                tuned_offset   = int(latency * 2.0)
-                tuned_interval = max(10, int(latency * 1.2))
-                if self._autotune_var.get():
-                    def _apply():
-                        self._offset_ms_var.set(tuned_offset)
-                        self._burst_interval_var.set(tuned_interval)
-                    self.after(0, _apply)
-                    log_cb("ok",
-                        f"[Auto-Tune] latency={latency:.1f}ms -> "
-                        f"offset={tuned_offset}ms interval={tuned_interval}ms (applied)")
-                else:
-                    log_cb("info",
-                        f"[Auto-Tune] latency={latency:.1f}ms -> "
-                        f"offset={tuned_offset}ms interval={tuned_interval}ms (not applied — auto-tune off)")
+                self._apply_autotune(latency, log_cb, apply=self._autotune_var.get())
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_run(self):
+    def _on_run(self) -> None:
         t1 = self._token1_var.get().strip()
         t2 = self._token2_var.get().strip()
         if not t1 or not t2:
@@ -479,48 +568,39 @@ class App(tk.Tk):
             return
 
         tokens = {1: t1, 2: t2}
-        cfg = {
-            "skip_timing":       self._skip_timing_var.get(),
-            "fire_hour":         self._fire_hour_var.get(),
-            "fire_min":          self._fire_min_var.get(),
-            "fire_sec":          self._fire_sec_var.get(),
-            "offset_ms":         self._offset_ms_var.get(),
-            "delay_ms":          self._delay_ms_var.get(),
-            "burst_interval_ms": self._burst_interval_var.get(),
-            "burst_count":       self._burst_count_var.get(),
-            "warmup_enabled":    self._warmup_var.get(),
-            "single_shot":       self._single_shot_var.get(),
-        }
+        cfg = Config(
+            skip_timing       = self._skip_timing_var.get(),
+            fire_hour         = self._fire_hour_var.get(),
+            fire_min          = self._fire_min_var.get(),
+            fire_sec          = self._fire_sec_var.get(),
+            offset_ms         = self._offset_ms_var.get(),
+            delay_ms          = self._delay_ms_var.get(),
+            burst_interval_ms = self._burst_interval_var.get(),
+            burst_count       = self._burst_count_var.get(),
+            warmup_enabled    = self._warmup_var.get(),
+            single_shot       = self._single_shot_var.get(),
+        )
 
         self._stop_event.clear()
         self._workers.clear()
         self._run_btn.configure(state="disabled")
-        self._stop_btn.configure(state="normal",
-                                 bg=COLORS["error"], fg="white",
-                                 activebackground="#be123c")
+        self._stop_btn.configure(
+            state="normal",
+            bg=COLORS["error"], fg="white",
+            activebackground="#be123c",
+        )
 
         log_cb = self._make_log_cb()
 
-        def _launch():
+        def _launch() -> None:
             device_id = gen_device_id()
-            latency = measure_latency(self._latency_session, t1, device_id, log_cb)
-            if latency:
-                tuned_offset   = int(latency * 2.0)
-                tuned_interval = max(10, int(latency * 1.2))
-                if self._autotune_var.get():
-                    cfg["offset_ms"]         = tuned_offset
-                    cfg["burst_interval_ms"] = tuned_interval
-                    def _apply():
-                        self._offset_ms_var.set(tuned_offset)
-                        self._burst_interval_var.set(tuned_interval)
-                    self.after(0, _apply)
-                    log_cb("ok",
-                        f"[Auto-Tune] latency={latency:.1f}ms -> "
-                        f"offset={tuned_offset}ms interval={tuned_interval}ms (applied)")
-                else:
-                    log_cb("info",
-                        f"[Auto-Tune] latency={latency:.1f}ms -> "
-                        f"offset={tuned_offset}ms interval={tuned_interval}ms (skipped — using manual values)")
+            latency   = measure_latency(self._latency_session, t1, device_id, log_cb)
+            if latency and self._autotune_var.get():
+                offset_ms, interval_ms = self._apply_autotune(latency, log_cb, apply=True)
+                cfg.offset_ms         = offset_ms
+                cfg.burst_interval_ms = interval_ms
+            elif latency:
+                self._apply_autotune(latency, log_cb, apply=False)
 
             log_cb("info", f"Starting slots: {enabled_slots}")
             for slot in enabled_slots:
@@ -533,35 +613,91 @@ class App(tk.Tk):
 
         threading.Thread(target=_launch, daemon=True).start()
 
-    def _on_stop(self):
+    def _on_stop(self) -> None:
         self._stop_event.set()
         self._log("warn", "Stop requested — workers will halt at next checkpoint.")
 
-        def _join_workers():
+        def _join_workers() -> None:
             for w in self._workers:
                 if w.thread.is_alive():
                     w.thread.join(timeout=2)
-            def _reset_buttons():
+            def _reset_buttons() -> None:
                 self._run_btn.configure(state="normal")
-                self._stop_btn.configure(state="disabled",
-                                         bg=COLORS["border"], fg=COLORS["text_dim"],
-                                         activebackground=COLORS["error"],
-                                         activeforeground="white")
+                self._stop_btn.configure(
+                    state="disabled",
+                    bg=COLORS["border"], fg=COLORS["text_dim"],
+                    activebackground=COLORS["error"],
+                    activeforeground="white",
+                )
             self.after(0, _reset_buttons)
 
         threading.Thread(target=_join_workers, daemon=True).start()
 
-    def _on_window_close(self):
+    def _on_window_close(self) -> None:
         self._on_stop()
         _cleanup_timer()
         self.destroy()
 
-    def _on_clear_log(self):
+    def _on_clear_log(self) -> None:
         self._log_box.configure(state="normal")
         self._log_box.delete("1.0", "end")
         self._log_box.configure(state="disabled")
 
-    def _build_ui(self):
+    def _section(self, parent, title: str):
+        outer = tk.Frame(parent, bg=COLORS["panel"],
+                         highlightbackground=COLORS["border_light"],
+                         highlightthickness=1)
+        outer.pack(fill="x", padx=10, pady=(10, 0))
+        tk.Frame(outer, bg=COLORS["accent"], width=3).pack(side="left", fill="y")
+        content = tk.Frame(outer, bg=COLORS["panel"])
+        content.pack(side="left", fill="both", expand=True)
+        tk.Label(content, text=title, bg=COLORS["panel"], fg=COLORS["text_dim"],
+                 font=(FONT_UI, 8, "bold")).pack(anchor="w", padx=10, pady=(7, 2))
+        inner = tk.Frame(content, bg=COLORS["panel"])
+        inner.pack(fill="x", padx=10, pady=(0, 10))
+        return inner
+
+    def _row(self, parent, label: str, widget_factory: Callable):
+        row = tk.Frame(parent, bg=COLORS["panel"])
+        row.pack(fill="x", pady=3)
+        tk.Label(row, text=label, bg=COLORS["panel"], fg=COLORS["text_dim"],
+                 font=(FONT_UI, 8), width=20, anchor="w").pack(side="left")
+        w = widget_factory(row)
+        w.pack(side="left", fill="x", expand=True)
+        return w
+
+    def _entry(self, parent, textvariable, **kw):
+        return tk.Entry(parent, textvariable=textvariable,
+                        bg=COLORS["input_bg"], fg=COLORS["text"],
+                        insertbackground=COLORS["accent"],
+                        relief="flat", font=(FONT_MONO, 9),
+                        highlightbackground=COLORS["border_light"],
+                        highlightcolor=COLORS["accent2"],
+                        highlightthickness=1, **kw)
+
+    def _spinbox(self, parent, var, from_: int, to: int, width: int = 7):
+        return tk.Spinbox(parent, textvariable=var,
+                          from_=from_, to=to, width=width,
+                          bg=COLORS["input_bg"], fg=COLORS["text"],
+                          buttonbackground=COLORS["border_light"],
+                          relief="flat", font=(FONT_MONO, 9),
+                          highlightbackground=COLORS["border_light"],
+                          highlightthickness=1)
+
+    def _checkbutton(self, parent, text: str, variable, command=None):
+        kw = dict(
+            text=text, variable=variable,
+            bg=COLORS["panel"], fg=COLORS["text"],
+            selectcolor=COLORS["accent_dim"],
+            activebackground=COLORS["panel"],
+            activeforeground=COLORS["accent"],
+            font=(FONT_UI, 9),
+        )
+        if command:
+            kw["command"] = command
+        return tk.Checkbutton(parent, **kw)
+
+    def _build_ui(self) -> None:
         C = COLORS
 
         hdr = tk.Frame(self, bg=C["header_bg"], height=62)
@@ -569,11 +705,11 @@ class App(tk.Tk):
         hdr.pack_propagate(False)
 
         left_hdr = tk.Frame(hdr, bg=C["header_bg"])
-        left_hdr.pack(side="left", padx=20, pady=0, fill="y")
+        left_hdr.pack(side="left", padx=20, fill="y")
 
-        badge = tk.Label(left_hdr, text=" MI ", bg=C["accent"], fg="white",
-                         font=(FONT_MONO, 11, "bold"), relief="flat", pady=2)
-        badge.pack(side="left", padx=(0, 12), pady=16)
+        tk.Label(left_hdr, text=" MI ", bg=C["accent"], fg="white",
+                 font=(FONT_MONO, 11, "bold"), relief="flat", pady=2).pack(
+                     side="left", padx=(0, 12), pady=16)
 
         title_frame = tk.Frame(left_hdr, bg=C["header_bg"])
         title_frame.pack(side="left", fill="y", pady=12)
@@ -596,7 +732,7 @@ class App(tk.Tk):
 
         tk.Frame(self, bg=C["accent"], height=2).pack(fill="x")
 
-        body = tk.Frame(self, bg=C["bg"])
+        body  = tk.Frame(self, bg=C["bg"])
         body.pack(fill="both", expand=True)
 
         paned = tk.PanedWindow(body, orient="horizontal",
@@ -612,49 +748,7 @@ class App(tk.Tk):
         self._build_config(left)
         self._build_slots_and_log(right)
 
-    def _section(self, parent, title):
-        outer = tk.Frame(parent, bg=COLORS["panel"],
-                         highlightbackground=COLORS["border_light"],
-                         highlightthickness=1)
-        outer.pack(fill="x", padx=10, pady=(10, 0))
-        accent_bar = tk.Frame(outer, bg=COLORS["accent"], width=3)
-        accent_bar.pack(side="left", fill="y")
-        content = tk.Frame(outer, bg=COLORS["panel"])
-        content.pack(side="left", fill="both", expand=True)
-        tk.Label(content, text=title, bg=COLORS["panel"], fg=COLORS["text_dim"],
-                 font=(FONT_UI, 8, "bold")).pack(anchor="w", padx=10, pady=(7, 2))
-        inner = tk.Frame(content, bg=COLORS["panel"])
-        inner.pack(fill="x", padx=10, pady=(0, 10))
-        return inner
-
-    def _row(self, parent, label, widget_factory):
-        row = tk.Frame(parent, bg=COLORS["panel"])
-        row.pack(fill="x", pady=3)
-        tk.Label(row, text=label, bg=COLORS["panel"], fg=COLORS["text_dim"],
-                 font=(FONT_UI, 8), width=20, anchor="w").pack(side="left")
-        w = widget_factory(row)
-        w.pack(side="left", fill="x", expand=True)
-        return w
-
-    def _entry(self, parent, textvariable, **kw):
-        return tk.Entry(parent, textvariable=textvariable,
-                        bg=COLORS["input_bg"], fg=COLORS["text"],
-                        insertbackground=COLORS["accent"],
-                        relief="flat", font=(FONT_MONO, 9),
-                        highlightbackground=COLORS["border_light"],
-                        highlightcolor=COLORS["accent2"],
-                        highlightthickness=1, **kw)
-
-    def _spinbox(self, parent, var, from_, to, width=7):
-        return tk.Spinbox(parent, textvariable=var,
-                          from_=from_, to=to, width=width,
-                          bg=COLORS["input_bg"], fg=COLORS["text"],
-                          buttonbackground=COLORS["border_light"],
-                          relief="flat", font=(FONT_MONO, 9),
-                          highlightbackground=COLORS["border_light"],
-                          highlightthickness=1)
-
-    def _build_config(self, parent):
+    def _build_config(self, parent) -> None:
         C = COLORS
 
         canvas = tk.Canvas(parent, bg=C["bg"], bd=0, highlightthickness=0)
@@ -666,13 +760,8 @@ class App(tk.Tk):
         inner = tk.Frame(canvas, bg=C["bg"])
         win   = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        def _on_frame_configure(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        def _on_canvas_configure(e):
-            canvas.itemconfig(win, width=e.width)
-
-        inner.bind("<Configure>", _on_frame_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
 
         def _on_mousewheel(e):
             if e.delta:
@@ -682,23 +771,26 @@ class App(tk.Tk):
             elif e.num == 5:
                 canvas.yview_scroll(1, "units")
 
-        def _bind_scroll(e):
-            self.bind_all("<MouseWheel>", _on_mousewheel)
-            self.bind_all("<Button-4>",   _on_mousewheel)
-            self.bind_all("<Button-5>",   _on_mousewheel)
+        parent.bind("<Enter>",  lambda e: (self.bind_all("<MouseWheel>", _on_mousewheel),
+                                           self.bind_all("<Button-4>",   _on_mousewheel),
+                                           self.bind_all("<Button-5>",   _on_mousewheel)))
+        parent.bind("<Leave>",  lambda e: (self.unbind_all("<MouseWheel>"),
+                                           self.unbind_all("<Button-4>"),
+                                           self.unbind_all("<Button-5>")))
 
-        def _unbind_scroll(e):
-            self.unbind_all("<MouseWheel>")
-            self.unbind_all("<Button-4>")
-            self.unbind_all("<Button-5>")
+        self._build_token_section(inner)
+        self._build_slots_section(inner)
+        self._build_timing_section(inner)
+        self._build_burst_section(inner)
+        self._build_advanced_section(inner)
+        self._build_run_buttons(inner)
 
-        parent.bind("<Enter>", _bind_scroll)
-        parent.bind("<Leave>", _unbind_scroll)
+    def _build_token_section(self, parent) -> None:
+        C   = COLORS
+        sec = self._section(parent, "TOKENS")
 
-
-        sec = self._section(inner, "TOKENS")
-        self._token1_var = tk.StringVar()
-        self._token2_var = tk.StringVar()
+        self._token1_var   = tk.StringVar()
+        self._token2_var   = tk.StringVar()
         self._token1_entry = self._row(sec, "Token 1",
             lambda p: self._entry(p, self._token1_var, show="*"))
         self._token2_entry = self._row(sec, "Token 2",
@@ -706,106 +798,91 @@ class App(tk.Tk):
 
         btn_row = tk.Frame(sec, bg=C["panel"])
         btn_row.pack(fill="x", pady=(4, 0))
-        tk.Button(btn_row, text="👁  Show/Hide",
-                  bg=C["border_light"], fg=C["text_dim"],
-                  activebackground=C["accent2_dim"], activeforeground=C["text"],
-                  relief="flat", font=(FONT_UI, 8), cursor="hand2", padx=6, pady=3,
-                  command=self._toggle_token_vis).pack(side="left", padx=(0, 6))
-        tk.Button(btn_row, text="💾  Save",
-                  bg=C["accent2_dim"], fg=C["text"],
-                  activebackground=C["accent2"], activeforeground="white",
-                  relief="flat", font=(FONT_UI, 8, "bold"), cursor="hand2", padx=6, pady=3,
-                  command=self._save_tokens).pack(side="left", padx=(0, 6))
-        tk.Button(btn_row, text="📡 Test Latency",
-                  bg=C["accent2_dim"], fg=C["text"],
-                  activebackground=C["accent2"], activeforeground="white",
-                  relief="flat", font=(FONT_UI, 8, "bold"), cursor="hand2", padx=6, pady=3,
-                  command=self._on_test_latency).pack(side="left")
 
-        sec2 = self._section(inner, "ENABLED SLOTS")
+        for text, bg, active_bg, cmd in [
+            ("👁  Show/Hide", C["border_light"],  C["accent2_dim"], self._toggle_token_vis),
+            ("💾  Save",      C["accent2_dim"],   C["accent2"],     self._save_tokens),
+            ("📡 Test Latency", C["accent2_dim"], C["accent2"],     self._on_test_latency),
+        ]:
+            tk.Button(btn_row, text=text, bg=bg, fg=C["text"],
+                      activebackground=active_bg, activeforeground=C["text"],
+                      relief="flat", font=(FONT_UI, 8, "bold"),
+                      cursor="hand2", padx=6, pady=3,
+                      command=cmd).pack(side="left", padx=(0, 6))
+
+    def _build_slots_section(self, parent) -> None:
+        C   = COLORS
+        sec = self._section(parent, "ENABLED SLOTS")
+
         self._slot_enabled = [tk.BooleanVar(value=True) for _ in range(4)]
-        sf = tk.Frame(sec2, bg=C["panel"])
+        sf = tk.Frame(sec, bg=C["panel"])
         sf.pack(fill="x")
         sf.columnconfigure(0, weight=1)
         sf.columnconfigure(1, weight=1)
         for i in range(4):
             r, c = divmod(i, 2)
-            tk.Checkbutton(sf, text=f"Slot {i+1}",
-                           variable=self._slot_enabled[i],
-                           bg=C["panel"], fg=C["text"],
-                           selectcolor=C["accent_dim"],
-                           activebackground=C["panel"],
-                           activeforeground=C["accent"],
-                           font=(FONT_UI, 9)).grid(row=r, column=c, sticky="w", padx=6, pady=2)
+            self._checkbutton(sf, f"Slot {i+1}", self._slot_enabled[i]).grid(
+                row=r, column=c, sticky="w", padx=6, pady=2)
 
-        sec3 = self._section(inner, "TIMING")
+    def _build_timing_section(self, parent) -> None:
+        sec = self._section(parent, "TIMING")
+
         self._skip_timing_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(sec3, text="Manual fire time (skip auto-midnight)",
-                       variable=self._skip_timing_var,
-                       bg=C["panel"], fg=C["text"],
-                       selectcolor=C["accent_dim"],
-                       activebackground=C["panel"],
-                       activeforeground=C["accent"],
-                       font=(FONT_UI, 9),
-                       command=self._toggle_manual_time).pack(anchor="w")
+        self._checkbutton(sec, "Manual fire time (skip auto-midnight)",
+                          self._skip_timing_var,
+                          command=self._toggle_manual_time).pack(anchor="w")
 
-        self._manual_frame = tk.Frame(sec3, bg=C["panel"])
+        self._manual_frame  = tk.Frame(sec, bg=COLORS["panel"])
         self._manual_frame.pack(fill="x")
         self._fire_hour_var = tk.IntVar(value=19)
         self._fire_min_var  = tk.IntVar(value=37)
         self._fire_sec_var  = tk.IntVar(value=0)
-        hf = tk.Frame(self._manual_frame, bg=C["panel"])
+
+        hf = tk.Frame(self._manual_frame, bg=COLORS["panel"])
         hf.pack(anchor="w")
         for label, var, hi in [("HH", self._fire_hour_var, 23),
                                 ("MM", self._fire_min_var,  59),
                                 ("SS", self._fire_sec_var,  59)]:
-            tk.Label(hf, text=label, bg=C["panel"], fg=C["text_dim"],
+            tk.Label(hf, text=label, bg=COLORS["panel"], fg=COLORS["text_dim"],
                      font=(FONT_UI, 8, "bold")).pack(side="left", padx=(6, 2))
             self._spinbox(hf, var, 0, hi, width=4).pack(side="left", padx=2)
         self._toggle_manual_time()
 
-        sec4 = self._section(inner, "BURST CONFIG")
-        self._offset_ms_var     = tk.IntVar(value=120)
-        self._burst_interval_var= tk.IntVar(value=50)
-        self._burst_count_var   = tk.IntVar(value=10)
+    def _build_burst_section(self, parent) -> None:
+        sec = self._section(parent, "BURST CONFIG")
 
-        self._row(sec4, "Pre-fire offset ms",
+        self._offset_ms_var      = tk.IntVar(value=120)
+        self._burst_interval_var = tk.IntVar(value=50)
+        self._burst_count_var    = tk.IntVar(value=10)
+
+        self._row(sec, "Pre-fire offset ms",
                   lambda p: self._spinbox(p, self._offset_ms_var, 0, 5000))
-        self._row(sec4, "Burst interval ms",
+        self._row(sec, "Burst interval ms",
                   lambda p: self._spinbox(p, self._burst_interval_var, 1, 1000))
-        self._row(sec4, "Burst count",
+        self._row(sec, "Burst count",
                   lambda p: self._spinbox(p, self._burst_count_var, 1, 50))
 
-        sec5 = self._section(inner, "ADVANCED TIMING")
-        self._delay_ms_var = tk.IntVar(value=500)
-        self._row(sec5, "Delay before midnight (ms)",
-                  lambda p: self._spinbox(p, self._delay_ms_var, 0, 10000))
-        self._warmup_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(sec5, text="Warm up session before firing",
-                       variable=self._warmup_var,
-                       bg=C["panel"], fg=C["text"],
-                       selectcolor=C["accent_dim"],
-                       activebackground=C["panel"],
-                       activeforeground=C["accent"],
-                       font=(FONT_UI, 9)).pack(anchor="w", pady=2)
-        self._single_shot_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(sec5, text="Single-shot mode (no burst)",
-                       variable=self._single_shot_var,
-                       bg=C["panel"], fg=C["text"],
-                       selectcolor=C["accent_dim"],
-                       activebackground=C["panel"],
-                       activeforeground=C["accent"],
-                       font=(FONT_UI, 9)).pack(anchor="w", pady=2)
-        self._autotune_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(sec5, text="Auto-tune timing on run",
-                       variable=self._autotune_var,
-                       bg=C["panel"], fg=C["text"],
-                       selectcolor=C["accent_dim"],
-                       activebackground=C["panel"],
-                       activeforeground=C["accent"],
-                       font=(FONT_UI, 9)).pack(anchor="w", pady=2)
+    def _build_advanced_section(self, parent) -> None:
+        sec = self._section(parent, "ADVANCED TIMING")
 
-        btn_sec = tk.Frame(inner, bg=C["bg"])
+        self._delay_ms_var = tk.IntVar(value=500)
+        self._row(sec, "Delay before midnight (ms)",
+                  lambda p: self._spinbox(p, self._delay_ms_var, 0, 10000))
+
+        self._warmup_var     = tk.BooleanVar(value=True)
+        self._single_shot_var = tk.BooleanVar(value=False)
+        self._autotune_var   = tk.BooleanVar(value=True)
+
+        for text, var in [
+            ("Warm up session before firing", self._warmup_var),
+            ("Single-shot mode (no burst)",   self._single_shot_var),
+            ("Auto-tune timing on run",        self._autotune_var),
+        ]:
+            self._checkbutton(sec, text, var).pack(anchor="w", pady=2)
+
+    def _build_run_buttons(self, parent) -> None:
+        C       = COLORS
+        btn_sec = tk.Frame(parent, bg=C["bg"])
         btn_sec.pack(fill="x", padx=10, pady=12)
 
         self._run_btn = tk.Button(btn_sec, text="▶  RUN",
@@ -826,22 +903,7 @@ class App(tk.Tk):
                                    command=self._on_stop)
         self._stop_btn.pack(fill="x")
 
-    def _toggle_token_vis(self):
-        for entry_name in ("_token1_entry", "_token2_entry"):
-            w = getattr(self, entry_name, None)
-            if w:
-                w.config(show="" if w.cget("show") == "*" else "*")
-
-    def _toggle_manual_time(self):
-        state = "normal" if self._skip_timing_var.get() else "disabled"
-        for child in self._manual_frame.winfo_children():
-            for subchild in (child.winfo_children() if hasattr(child, "winfo_children") else []):
-                try: subchild.configure(state=state)
-                except: pass
-            try: child.configure(state=state)
-            except: pass
-
-    def _build_slots_and_log(self, parent):
+    def _build_slots_and_log(self, parent) -> None:
         C = COLORS
 
         slot_frame = tk.Frame(parent, bg=C["bg"])
@@ -852,34 +914,29 @@ class App(tk.Tk):
         slot_frame.columnconfigure(1, weight=1)
 
         for i in range(4):
-            r, c  = divmod(i, 2)
-            pane  = tk.Frame(slot_frame, bg=C["panel"],
-                             highlightbackground=C["border_light"],
-                             highlightthickness=1)
+            r, c = divmod(i, 2)
+            pane = tk.Frame(slot_frame, bg=C["panel"],
+                            highlightbackground=C["border_light"],
+                            highlightthickness=1)
             pane.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
 
             hrow = tk.Frame(pane, bg=C["panel"])
             hrow.pack(fill="x", padx=8, pady=(8, 0))
-            slot_badge = tk.Label(hrow, text=f"{i+1}",
-                                  bg=C["accent"], fg="white",
-                                  font=(FONT_MONO, 9, "bold"), width=2, pady=1)
-            slot_badge.pack(side="left", padx=(0, 6))
-            tk.Label(hrow, text=f"SLOT {i+1}",
-                     bg=C["panel"], fg=C["text"],
+            tk.Label(hrow, text=f"{i+1}", bg=C["accent"], fg="white",
+                     font=(FONT_MONO, 9, "bold"), width=2, pady=1).pack(side="left", padx=(0, 6))
+            tk.Label(hrow, text=f"SLOT {i+1}", bg=C["panel"], fg=C["text"],
                      font=(FONT_UI, 10, "bold")).pack(side="left", anchor="w")
 
             tk.Label(pane, text=f"Token #{SLOT_TOKEN_MAP[i+1]}",
                      bg=C["panel"], fg=C["muted"],
                      font=(FONT_UI, 8)).pack(anchor="w", padx=8)
-
             tk.Label(pane, textvariable=self._slot_status[i],
                      bg=C["panel"], fg=C["accent2"],
                      font=(FONT_MONO, 9, "bold")).pack(anchor="w", padx=8, pady=(2, 8))
 
         log_header = tk.Frame(parent, bg=C["bg"])
         log_header.pack(fill="x", padx=10, pady=(6, 2))
-        tk.Label(log_header, text="LIVE LOG",
-                 bg=C["bg"], fg=C["text_dim"],
+        tk.Label(log_header, text="LIVE LOG", bg=C["bg"], fg=C["text_dim"],
                  font=(FONT_UI, 9, "bold")).pack(side="left")
         tk.Button(log_header, text="✕ Clear",
                   bg=C["border"], fg=C["text_dim"],
@@ -909,9 +966,30 @@ class App(tk.Tk):
 
         self._log("info", "GUI loaded. Fill tokens, configure, then press RUN.")
 
-def main():
+    def _toggle_token_vis(self) -> None:
+        for attr in ("_token1_entry", "_token2_entry"):
+            w = getattr(self, attr, None)
+            if w:
+                w.config(show="" if w.cget("show") == "*" else "*")
+
+    def _toggle_manual_time(self) -> None:
+        state = "normal" if self._skip_timing_var.get() else "disabled"
+        for child in self._manual_frame.winfo_children():
+            for sub in (child.winfo_children() if hasattr(child, "winfo_children") else []):
+                try:
+                    sub.configure(state=state)
+                except tk.TclError:
+                    pass
+            try:
+                child.configure(state=state)
+            except tk.TclError:
+                pass
+
+
+def main() -> None:
     app = App()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
